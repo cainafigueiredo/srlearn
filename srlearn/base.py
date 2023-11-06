@@ -10,6 +10,7 @@ import json
 import logging
 import warnings
 
+from graphviz import Source
 from sklearn.utils.validation import check_is_fitted
 import subprocess
 
@@ -70,8 +71,8 @@ class BaseBoostedRelationalModel:
                 ", pass one or the other as an argument to suppress this warning.", FutureWarning)
             self.solver = "BoostSRL"
         else:
-            if solver not in ("BoostSRL", "SRLBoost"):
-                raise ValueError("`solver` must be 'SRLBoost' or 'BoostSRL'")
+            if solver not in ("BoostSRL", "SRLBoost", "BoostSRLTransferLearner"):
+                raise ValueError("`solver` must be 'SRLBoost', 'BoostSRL', or 'BoostSRLTransferLearner'")
             self.solver = solver
 
         if isinstance(background, Background):
@@ -330,6 +331,15 @@ class BaseBoostedRelationalModel:
             ) as _fh:
                 dotfiles.append(_fh.read())
         self._dotfiles = dotfiles
+
+    def _generate_dotimages(self):
+        dotimages = []
+        for i in range(self.n_estimators):
+            path = self.file_system.files.DOT_DIR.joinpath(
+                "WILLTreeFor_" + self.target + str(i) + ".dot"
+            )
+            dotimages.append(Source.from_file(path))
+        self._dotimages = dotimages
 
     def _check_initialized(self):
         """Check for the estimator(s), raise an error if not found."""
