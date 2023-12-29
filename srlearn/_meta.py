@@ -6,5 +6,5 @@ srlearn metadata
 - Versioning should follow SemVer (https://semver.org)
 """
 
-__author__ = "Alexander L. Hayes (hayesall)"
-__version__ = "0.5.5"
+__author__ = "Cainã Figueiredo Pereira (adapted from Alexander L. Hayes' implementation)"
+__version__ = "1.0.0"

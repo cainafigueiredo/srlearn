@@ -9,7 +9,7 @@ import os
 __all__ = ["reset", "FileSystem"]
 
 
-def reset(soft=False):
+def reset(soft = False, path = None):
     """Reset the FileSystem
 
     In some circumstances, a :class:`FileSystem` object may not properly clean up
@@ -63,8 +63,8 @@ def reset(soft=False):
     >>> system_manager.reset()   # doctest: +SKIP
     []
     """
-    _here = pathlib.Path(__file__).parent
-    _data = _here.joinpath(FileSystem.boostsrl_data_directory)
+    path = pathlib.Path(__file__).parent if not path else pathlib.Path(path)
+    _data = path.joinpath(FileSystem.boostsrl_data_directory)
 
     if not _data.exists():
         return []
@@ -81,10 +81,11 @@ class BoostSRLFiles:
     After initialization, all of these should be constant.
     """
 
-    def __init__(self, directory, here) -> None:
+    def __init__(self, directory) -> None:
+        directory = pathlib.Path(os.path.abspath(str(directory)))
+        here = pathlib.Path(__file__).parent
         self.DIRECTORY = directory
         self.BOOSTSRL_BACKEND = here.joinpath("BoostSRL.jar")
-        self.SRLBOOST_BACKEND = here.joinpath("SRLBoost.jar")
         self.BOOSTSRL_TRANFER_LEARNER_BACKEND = here.joinpath("BoostSRLTransferLearner.jar")
         self.AUC_JAR = here
         self.TRAIN_LOG = directory.joinpath("train_output.txt")
@@ -139,27 +140,27 @@ class FileSystem:
     # In case of failure, this directory should be safe to delete.
     boostsrl_data_directory = "bsrl_data"
 
-    def __init__(self):
+    def __init__(self, path = None):
         """Initialize a BoostSRL File System.
 
         This will create directories that are cleaned up when the instance
         is de-allocated.
         """
 
-        _here = pathlib.Path(__file__).parent
+        path = pathlib.Path(__file__).parent if not path else pathlib.Path(path)
 
         # Allocate a location where data can safely be stored.
-        _data = _here.joinpath(FileSystem.boostsrl_data_directory)
+        _data = path.joinpath(FileSystem.boostsrl_data_directory)
         _allotment_number = self._allocate_space(_data)
         _directory = _data.joinpath("data" + str(_allotment_number))
 
-        self.files = BoostSRLFiles(_directory, _here)
+        self.files = BoostSRLFiles(_directory)
         self.files.TRAIN_DIR.mkdir()
         self.files.TEST_DIR.mkdir()
 
-    def __del__(self):
-        """Clean up the file system on object de-allocation."""
-        shutil.rmtree(self.files.DIRECTORY)
+    # def __del__(self):
+    #     """Clean up the file system on object de-allocation."""
+    #     shutil.rmtree(self.files.DIRECTORY, ignore_errors = True)
 
     @staticmethod
     def _allocate_space(current_directory) -> int:

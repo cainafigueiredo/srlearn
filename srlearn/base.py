@@ -58,21 +58,20 @@ class BaseBoostedRelationalModel:
         max_tree_depth=3,
         neg_pos_ratio=2,
         solver = None,
+        path = None
     ):
         """Initialize a BaseEstimator"""
         self.background = background
         self.target = target
         self.n_estimators = n_estimators
         self.neg_pos_ratio = neg_pos_ratio
+        self.path = path
 
         if solver is None:
-            warnings.warn(
-                "solver='BoostSRL' will default to solver='SRLBoost' in 0.6.0"
-                ", pass one or the other as an argument to suppress this warning.", FutureWarning)
             self.solver = "BoostSRL"
         else:
-            if solver not in ("BoostSRL", "SRLBoost", "BoostSRLTransferLearner"):
-                raise ValueError("`solver` must be 'SRLBoost', 'BoostSRL', or 'BoostSRLTransferLearner'")
+            if solver not in ("BoostSRL", "BoostSRLTransferLearner"):
+                raise ValueError("`solver` must be 'BoostSRL', or 'BoostSRLTransferLearner'")
             self.solver = solver
 
         if isinstance(background, Background):
@@ -158,7 +157,7 @@ class BaseBoostedRelationalModel:
                     raise ValueError(message)
 
         # If all params are valid, allocate a FileSystem:
-        self.file_system = FileSystem()
+        self.file_system = FileSystem(path = self.path)
 
     def to_json(self, file_name) -> None:
         """Serialize a learned model to json.
@@ -188,13 +187,8 @@ class BaseBoostedRelationalModel:
             _model = _fh.read().splitlines()
 
         model_params = {
-            "background": dict(self.background.__dict__.items()),
-            "target": self.target,
-            "n_estimators": self.n_estimators,
-            "node_size": self.node_size,
-            "max_tree_depth": self.max_tree_depth,
-            "neg_pos_ratio": self.neg_pos_ratio,
-            "solver": self.solver,
+            **self.__dict__,
+            "background": dict(self.background.__dict__.items())
         }
 
         with open(file_name, "w") as _fh:
@@ -346,7 +340,7 @@ class BaseBoostedRelationalModel:
         check_is_fitted(self, "estimators_")
 
     @staticmethod
-    def _call_shell_command(shell_command):
+    def _call_shell_command(shell_command, ignoreSTDOUT = True):
         """Start a new process to execute a shell command.
 
         This is intended for use in calling jar files. It opens a new process and
@@ -362,20 +356,25 @@ class BaseBoostedRelationalModel:
         None
         """
 
-        _pid = subprocess.Popen(shell_command, shell=True)
+        _pid = subprocess.Popen(
+            shell_command, 
+            shell=True, 
+            stdout = subprocess.DEVNULL if ignoreSTDOUT else None,
+            stderr = subprocess.DEVNULL if ignoreSTDOUT else None
+        )
         _status = _pid.wait()
         if _status != 0:
             raise RuntimeError(
                 "Error when running shell command: {0}".format(shell_command)
             )
 
-    def fit(self, database):
+    def fit(self, database, ignoreSTDOUT = True):
         raise NotImplementedError
 
-    def predict(self, database):
+    def predict(self, database, ignoreSTDOUT = True):
         raise NotImplementedError
 
-    def predict_proba(self, database):
+    def predict_proba(self, database, ignoreSTDOUT = True):
         raise NotImplementedError
 
     def __repr__(self):
