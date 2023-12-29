@@ -37,6 +37,7 @@ import copy
 import re
 
 from typing import Type, Dict, List, Tuple
+from .weight import WeightStrategyBase, UniformWeight
 from .utils import utils
 
 class Database:
@@ -305,34 +306,66 @@ class Database:
         self,
         targetDatabase: Type["Database"]
     ) -> List[Tuple[Dict, Dict]]:
-        # TODO: what to handle mapping for recursion predicates? Suggestion: Map only the target predicate. Then, recursion relations of both domains are automatically mapped. I will probably need to modify the method applyMapping. I can remove recursion predicates from the list of relations to be mapped and then include a mapping between the recursions of target predicates from both domains.
         sourceDatabase = self
         sourceSchemaPreds = sourceDatabase.extractSchemaPreds()
         targetSchemaPreds = targetDatabase.extractSchemaPreds()
+        
         targetDomainTargetRelation = targetDatabase.getTargetRelation()
-        targetDomainTargetPredicateTermTypes = targetSchemaPreds[targetDomainTargetRelation]
-        newTargetSchemaPreds = {**targetSchemaPreds}
-        del newTargetSchemaPreds[targetDomainTargetRelation]
+        recursivePredicateTargetDomain = f"recursion_{targetDomainTargetRelation}"
+        if recursivePredicateTargetDomain in targetSchemaPreds:
+            del targetSchemaPreds[recursivePredicateTargetDomain]
+        else:
+            recursivePredicateTargetDomain = None
+
+        sourceDomainTargetPredicate = sourceDatabase.getTargetRelation()
+        recursivePredicateSourceDomain = f"recursion_{sourceDomainTargetPredicate}"
+        if recursivePredicateSourceDomain in sourceSchemaPreds:
+            del sourceSchemaPreds[recursivePredicateSourceDomain]
+        else:
+            recursivePredicateSourceDomain = None
+
         allMappings = []
-        for candidateSourceRelation, candidateSourcePredicateTermTypes in sourceSchemaPreds.items():
-            if utils.isCompatible(
-                candidateSourceRelation, 
-                targetDomainTargetRelation, 
-                candidateSourcePredicateTermTypes,
-                targetDomainTargetPredicateTermTypes,
-                {}
-            ):
-                relationMapping = {candidateSourceRelation: targetDomainTargetRelation}
-                termTypeMapping = dict(zip(candidateSourcePredicateTermTypes, targetDomainTargetPredicateTermTypes))
-                newSourceSchemaPreds = {**sourceSchemaPreds}
-                del newSourceSchemaPreds[candidateSourceRelation]
-                mappings = Database._findAllValidMappingsRecursive(
-                    newSourceSchemaPreds, 
-                    newTargetSchemaPreds,
-                    relationMapping = relationMapping,
-                    termTypeMapping = termTypeMapping
-                )
-                allMappings += mappings
+
+        if targetDomainTargetRelation:
+            targetDomainTargetPredicateTermTypes = targetSchemaPreds[targetDomainTargetRelation]
+            del targetSchemaPreds[targetDomainTargetRelation]
+
+            for candidateSourceRelation, candidateSourcePredicateTermTypes in sourceSchemaPreds.items():
+                if utils.isCompatible(
+                    candidateSourceRelation, 
+                    targetDomainTargetRelation, 
+                    candidateSourcePredicateTermTypes,
+                    targetDomainTargetPredicateTermTypes,
+                    {}
+                ):
+                    relationMapping = {
+                        candidateSourceRelation: targetDomainTargetRelation, 
+                    }
+                    if recursivePredicateTargetDomain:
+                        recursiveCandidateSourceRelation = f"recursion_{candidateSourceRelation}"
+                        relationMapping[recursiveCandidateSourceRelation] = recursivePredicateTargetDomain
+                    termTypeMapping = dict(
+                        zip(candidateSourcePredicateTermTypes, targetDomainTargetPredicateTermTypes)
+                    )
+                    newSourceSchemaPreds = {**sourceSchemaPreds}
+                    del newSourceSchemaPreds[candidateSourceRelation]
+                    mappings = Database._findAllValidMappingsRecursive(
+                        newSourceSchemaPreds, 
+                        targetSchemaPreds,
+                        relationMapping = relationMapping,
+                        termTypeMapping = termTypeMapping
+                    )
+                    allMappings += mappings
+                    
+        else:
+            mappings = Database._findAllValidMappingsRecursive(
+                sourceSchemaPreds,
+                targetSchemaPreds, 
+                relationMapping = {},
+                termTypeMapping = {}
+            )
+            allMappings += mappings
+
         return allMappings
     
     def resetTargetPredicate(self) -> Type["Database"]:
@@ -378,7 +411,7 @@ class Database:
         database.facts += utils.renameRelationsInPredicates(database.pos, mapping = mapping)
         return database
 
-    def setTargetPredicate(self, relationName, useRecursion = True, negPosRatio = 1, seed = None, maxFailedNegSamplingRetries = 50) -> Type["Database"]:
+    def setTargetPredicate(self, relationName, useRecursion = False, negPosRatio = 1, seed = None, maxFailedNegSamplingRetries = 50) -> Type["Database"]:
         """Move positive examples of target predicate to facts and move facts of 'relationName' to positive examples list. Then, it samples negative examples."""
         assert type(negPosRatio) is int
         database = self.resetTargetPredicate()
@@ -481,21 +514,62 @@ class Database:
     
     @staticmethod
     def prepareTransferLearningDatabase(
-            sourceDatabase: Type["Database"], targetDatabase: Type["Database"]
+            sourceDatabase: Type["Database"], targetDatabase: Type["Database"], weightStrategy: WeightStrategyBase
     ) -> Type["TransferLearningDatabase"]:
         if sourceDatabase.isCompatibleWithDatabase(targetDatabase):
-            database = TransferLearningDatabase(sourceDatabase, targetDatabase)
+            database = TransferLearningDatabase(sourceDatabase, targetDatabase, weightStrategy)
             return database
         
 class TransferLearningDatabase(Database):
-    def __init__(self, sourceDatabase: Type["Database"], targetDatabase: Type["Database"]):
-        super(TransferLearningDatabase, self).__init__()
-        self.facts = sourceDatabase.facts + targetDatabase.facts
-        self.pos = sourceDatabase.pos + targetDatabase.pos
-        self.neg = sourceDatabase.neg + targetDatabase.neg
-        self.modes = targetDatabase.modes
-        self.posExampleDomain = ["sourceDomain" for i in sourceDatabase.pos] + ["targetDomain" for i in targetDatabase.pos]
-        self.negExampleDomain = ["sourceDomain" for i in sourceDatabase.neg] + ["targetDomain" for i in targetDatabase.neg]
+    def __init__(self, sourceDatabase: Type["Database"], targetDatabase: Type["Database"], weightStrategy: WeightStrategyBase):
+        self.sourceDatabase = sourceDatabase
+        self.targetDatabase = targetDatabase
+        self.weightStrategy = weightStrategy
+
+    def getSourceDatabase(self):
+        return self.sourceDatabase
+    
+    def getTargetDatabase(self):
+        return self.targetDatabase
+    
+    @property
+    def facts(self):
+        facts = self.sourceDatabase.facts + self.targetDatabase.facts
+        return facts
+    
+    @property
+    def modes(self):
+        modes = self.targetDatabase.modes
+        return modes
+    
+    @property
+    def examples(self):
+        examples = [
+            {"domain": "sourceDomain", "label": "pos", "example": example} for example in self.sourceDatabase.pos
+        ]
+        examples += [
+            {"domain": "sourceDomain", "label": "neg", "example": example} for example in self.sourceDatabase.neg
+        ]
+        examples += [
+            {"domain": "targetDomain", "label": "pos", "example": example} for example in self.targetDatabase.pos
+        ]
+        examples += [
+            {"domain": "targetDomain", "label": "neg", "example": example} for example in self.targetDatabase.neg
+        ]
+        weights = self.weightStrategy.getWeights(examples)
+        for example, weight in zip(examples, weights):
+            example["weight"] = weight
+        return examples
+    
+    @property
+    def pos(self):
+        pos = [example for example in self.examples if example["label"] == "pos"]
+        return pos
+    
+    @property
+    def neg(self):
+        neg = [example for example in self.examples if example["label"] == "neg"]
+        return neg
 
     def write(self, filename: str = "train", location: pathlib.Path = pathlib.Path("train")) -> None:
         def _write(_filename, _location, _type):
@@ -504,19 +578,45 @@ class TransferLearningDatabase(Database):
             ) as _fh:
                 
                 if _type == "pos":
-                    for exampleDomain, example in zip(self.posExampleDomain, self.pos):
-                        _fh.write(f"{exampleDomain}: {example}\n")
+                    for posExample in self.pos:
+                        domain = posExample["domain"]
+                        exampleLiteral = posExample["example"].replace(').', ')')
+                        weight = posExample["weight"]
+                        _fh.write(f"instance({domain},{weight},{exampleLiteral}).\n")
 
                 elif _type == "neg":
-                    for exampleDomain, example in zip(self.negExampleDomain, self.neg):
-                        _fh.write(f"{exampleDomain}: {example}\n")
+                    for negExample in self.neg:
+                        domain = negExample["domain"]
+                        exampleLiteral = negExample["example"].replace(').', ')')
+                        weight = negExample["weight"]
+                        _fh.write(f"instance({domain},{weight},{exampleLiteral}).\n")
 
                 elif _type == "facts":
-                    for example in self.facts:
-                        _fh.write(f"{example}\n")
+                    for fact in self.facts:
+                        _fh.write(f"{fact}\n")
 
         location.mkdir(exist_ok = True)
 
         _write(filename, location, "pos")
         _write(filename, location, "neg")
         _write(filename, location, "facts")
+
+    def __repr__(self) -> str:
+        return (
+            "Positive Examples:\n"
+            + str(self.pos)
+            + "\nNegative Examples:\n"
+            + str(self.neg)
+            + "\nFacts:\n"
+            + str(self.facts)
+        )
+    
+    def applyMapping(self, relationMapping: Dict, termTypeMapping: Dict, termPrefix: str = None):
+        return NotImplementedError()
+    
+    def getTargetRelation(self):
+        if len(self.pos) > 0:
+            relation = re.findall(r"(.*)\(.*\)\.", self.pos[0]["example"])[0]
+        else:
+            relation = None
+        return relation
