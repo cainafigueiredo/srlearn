@@ -24,7 +24,6 @@ class Background:
         ranges=None,
         number_of_clauses=100,
         number_of_cycles=100,
-        recursion=False,
         line_search=False,
         use_std_logic_variables=False,
         use_prolog_variables=True,
@@ -50,8 +49,6 @@ class Background:
             increments even if no new clauses are learned.
         line_search : bool, optional (default: False)
             Use lineSearch
-        recursion : bool, optional (default: False)
-            Use recursion
         use_std_logic_variables : bool, optional (default: False)
             Set the stdLogicVariables parameter to True
         use_prolog_variables : bool, optional (default: True)
@@ -119,7 +116,6 @@ class Background:
         self.number_of_clauses = number_of_clauses
         self.number_of_cycles = number_of_cycles
         self.line_search = line_search
-        self.recursion = recursion
         self.use_std_logic_variables = use_std_logic_variables
         self.use_prolog_variables = use_prolog_variables
         self.load_all_libraries = load_all_libraries
@@ -147,7 +143,6 @@ class Background:
             (self.bridgers, (list, type(None)), (), "'bridgers' should be 'None' or 'list'"),
             (self.ranges, (dict, type(None)), (), "'ranges' should be 'None' or 'dict'"),
             (self.line_search, (bool,), (), "'line_search' should be 'bool'"),
-            (self.recursion, (bool,), (), "'recursion' should be 'bool'"),
             (self.node_size, (int,), (lambda x: x >= 1,), "'node_size' should be 'int' >= 1"),
             (self.max_tree_depth, (int,), (lambda x: x >= 1,), "'max_tree_depth' should be 'int' >= 1"),
             (self.number_of_clauses, (int,), (lambda x: x >= 1,), "'number_of_clauses' should be 'int' >= 1"),
@@ -212,7 +207,6 @@ class Background:
 
         _background_syntax = {
             "line_search": "setParam: lineSearch={0}.\n",
-            "recursion": "setParam: recursion={0}.\n",
             "node_size": "setParam: nodeSize={0}.\n",
             "max_tree_depth": "setParam: maxTreeDepth={0}.\n",
             "number_of_clauses": "setParam: numOfClauses={0}.\n",

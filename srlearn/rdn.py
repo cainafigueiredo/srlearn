@@ -16,6 +16,14 @@ from .database import TransferLearningDatabase, Database
 
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score 
 
+# TODO: Install TreeBoostler as a dependency and change how it is imported.
+PROJECT_DIR = os.path.dirname(__file__)
+RELATED_WORK_PATH = os.path.abspath(f"{PROJECT_DIR}/../../../relatedWork")
+sys.path.append(RELATED_WORK_PATH)
+from TreeBoostler.revision import revision
+from TreeBoostler.tboostsrl import tboostsrl
+from TreeBoostler.transfer import transfer
+
 warnings.simplefilter("default")
 
 class RDNBoost(BaseBoostedRelationalModel):
@@ -326,6 +334,278 @@ class RDNBoostTransferLearning(BaseBoostedRelationalModel):
         # TODO: Get training time. It can be extracted from the training output file. Where can we store this metric? Maybe we can store in `self._prediction_metrics`. In that case, is it better to change the name of this attribute to something like `_metrics`?
 
         return self
+
+    def _run_inference(self, database, ignoreSTDOUT = True) -> None:
+        """Run inference mode on the BoostSRL Jar files.
+
+        This is a helper method for ``self.predict`` and ``self.predict_proba``
+        """
+
+        self._check_initialized()
+
+        # Write the background to file.
+        self.background.write(
+            filename="test", location=self.file_system.files.TEST_DIR
+        )
+
+        # Write the data to files.
+        database.write(filename="test", location=self.file_system.files.TEST_DIR)
+       
+        _jar = str(self.file_system.files.BOOSTSRL_TRANFER_LEARNER_BACKEND)
+
+        _CALL = (
+            "java -jar "
+            + _jar
+            + " -i -test "
+            + str(self.file_system.files.TEST_DIR)
+            + " -model "
+            + str(self.file_system.files.MODELS_DIR)
+            + " -target "
+            + self.target
+            + " -trees "
+            + str(self.n_estimators)
+            + " -aucJarPath "
+            + str(self.file_system.files.AUC_JAR)
+            + " 2>&1 | tee "
+            + str(self.file_system.files.TEST_LOG)
+        )
+
+        self._call_shell_command(_CALL, ignoreSTDOUT = ignoreSTDOUT)
+
+        # Read the threshold
+        with open(self.file_system.files.TEST_LOG, "r") as _fh:
+            log = _fh.read()
+            self._prediction_metrics = {}
+            self._prediction_metrics["threshold"] = re.findall(r".*threshold = (\d*\.?\d*)", log)[0]
+            self._prediction_metrics["cll"] = re.findall(r".*CLL.*= (-?\d*\.?\d*)", log)[0]
+            self._prediction_metrics["aucROC"] = re.findall(r".*AUC ROC.*= (\d*\.?\d*)", log)[0]
+            self._prediction_metrics["aucPR"] = re.findall(r".*AUC PR.*= (\d*\.?\d*)", log)[0]
+            self._prediction_metrics["prec"] = re.findall(r".*Precision.*= (\d*\.?\d*).*", log)[0]
+            self._prediction_metrics["rec"] = re.findall(r".*Recall.*= (\d*\.?\d*)", log)[0]
+            self._prediction_metrics["f1"] = re.findall(r"\%.*F1.*= (\d*\.?\d*)", log)[0]
+            # TODO: Get inference time. It can be extracted from the same file from which the metrics above were extracted.
+
+    def predict(self, database, threshold = None, ignoreSTDOUT = True):
+        """Use the learned model to predict on new data.
+
+        Parameters
+        ----------
+        database : :class:`srlearn.Database`
+            Database containing examples and facts.
+        threshold: float (default: None)
+            Classification threshold. If None, it uses the threshold specified by self._threshold.
+            
+        Returns
+        -------
+        results : ndarray
+            Positive or negative class.
+        """
+
+        predictedProbabilities = self.predict_proba(database, ignoreSTDOUT = ignoreSTDOUT)
+
+        threshold = threshold if threshold is not None else self._threshold
+
+        predictedLabels = np.greater(
+            predictedProbabilities, threshold
+        )
+
+        if threshold != self._prediction_metrics["threshold"]:
+            trueLabels = self.classes_
+            self._prediction_metrics["acc"] = accuracy_score(trueLabels, predictedLabels)
+            self._prediction_metrics["pr"] = precision_score(trueLabels, predictedLabels)
+            self._prediction_metrics["rec"] = recall_score(trueLabels, predictedLabels)
+            self._prediction_metrics["f1"] = f1_score(trueLabels, predictedLabels)
+
+        return predictedLabels
+
+    def predict_proba(self, database, ignoreSTDOUT = True):
+        """Return class probabilities.
+
+        Parameters
+        ----------
+        database : :class:`srlearn.Database`
+            Database containing examples and facts.
+
+        Returns
+        -------
+        results : ndarray
+            Probability of belonging to the positive class
+        """
+
+        self._run_inference(database, ignoreSTDOUT = ignoreSTDOUT)
+
+        _results_db = self.file_system.files.TEST_DIR.joinpath(
+            "results_" + self.target + ".db"
+        )
+        _classes, _results = np.genfromtxt(
+            _results_db,
+            delimiter=") ",
+            usecols=(0, 1),
+            converters={0: lambda s: 0 if s[0] == 33 else 1},
+            unpack=True,
+        )
+
+        _neg = _results[_classes == 0]
+        _pos = _results[_classes == 1]
+        _results2 = np.concatenate((_pos, 1 - _neg), axis=0)
+
+        self.classes_ = _classes
+
+        return _results2
+
+class TreeBoostler(BaseBoostedRelationalModel):
+    def __init__(
+        self,
+        *,
+        sourceBackground = None,
+        targetBackground = None,
+        searchArgPermutation: bool = True,
+
+        target = "None",
+        n_estimators = 10,
+        node_size = 2,
+        max_tree_depth = 3,
+        neg_pos_ratio = 2,
+        utility_alpha = 1,
+        path = None
+    ):
+        # TODO: Add a description to the class.
+
+        super().__init__(
+            background = None,
+            target = target,
+            n_estimators = n_estimators,
+            node_size = node_size,
+            max_tree_depth = max_tree_depth,
+            neg_pos_ratio = neg_pos_ratio,
+            solver = "BoostSRLTransferLearner",
+            path = path
+        )
+        self.utility_alpha = utility_alpha
+        self.sourceBackground = sourceBackground
+        self.targetBackground = targetBackground
+        self.searchArgPermutation = searchArgPermutation
+
+    def _check_params(self):
+        if not (self.utility_alpha >= 0):
+            raise ValueError("Alpha for alpha-fairness should be greater than or equal to zero.")
+        super()._check_params()
+
+    def fit(self, sourceDatabase: Database, targetDatabase: Database, ignoreSTDOUT = True):
+        self._check_params()
+
+        if not isinstance(sourceDatabase, Database):
+            raise ValueError("Source database should be an instance of Database class.")
+
+        if not isinstance(targetDatabase, Database):
+            raise ValueError("Target database should be an instance of Database class.")
+
+        sourceDomainTargetPredicate = sourceDatabase.getTargetRelation()
+        self.sourceBackground.write("background", pathlib.Path("./tboostsrl"))
+        os.system("mv ./tboostsrl/background_bk.txt ./tboostsrl/background.txt")
+        self.sourceBackground.target = [sourceDomainTargetPredicate]
+
+        sourceDomainTargetPredicate = sourceDatabase.getTargetRelation()
+
+        revision.learn_model(
+            self.sourceBackground, 
+            tboostsrl, 
+            sourceDomainTargetPredicate, 
+            sourceDatabase.pos, 
+            sourceDatabase.neg, 
+            sourceDatabase.facts, 
+            refine=None, 
+            trees=self.neg_pos_ratio
+        )
+
+        learnResults = revision.learn_model(
+            self.sourceBackground, 
+            tboostsrl, 
+            sourceDomainTargetPredicate, 
+            sourceDatabase.pos,
+            sourceDatabase.neg, 
+            sourceDatabase.facts, 
+            refine = None, 
+            trees = self.n_estimators
+        )
+        
+        model, totalRevisionTime, sourceStructured, will, variances = learnResults
+
+        targetDomainTargetPredicate = targetDatabase.getTargetRelation()
+        self.targetBackground.write("background", pathlib.Path("./tboostsrl"))
+        os.system("mv ./tboostsrl/background_bk.txt ./tboostsrl/background.txt")
+        self.targetBackground.target = [targetDomainTargetPredicate]
+
+        transferredStructured = sourceStructured
+        transferFile = transfer.get_transfer_file(
+            sourceDatabase.modes, 
+            targetDatabase.modes,
+            sourceDomainTargetPredicate, 
+            targetDomainTargetPredicate, 
+            searchArgPermutation = self.searchArgPermutation,
+            allowSameTargetMap = self.allowSameTargetMap
+        )
+
+        revisionResults = revision.theory_revision(
+            self.targetBackground, 
+            tboostsrl, 
+            targetDomainTargetPredicate, 
+            targetDatabase.pos, 
+            targetDatabase.neg, 
+            targetDatabase.facts,
+            targetDatabaseTest.pos, 
+            targetDatabaseTest.neg, 
+            targetDatabaseTest.facts,
+            transferredStructured, 
+            transfer = transferFile, 
+            trees = self.n_estimators, 
+            max_revision_iterations = self.maxRevisionIterations
+        )
+        model, tResults, structured, plTRresults = revisionResults
+
+        # # Write the data to files.
+        # database.write(
+        #     filename="train", location=self.file_system.files.TRAIN_DIR
+        # )
+
+        # _jar = str(self.file_system.files.BOOSTSRL_TRANFER_LEARNER_BACKEND)
+
+        # _CALL = (
+        #     "java -jar "
+        #     + _jar
+        #     + " -l -train "
+        #     + str(self.file_system.files.TRAIN_DIR)
+        #     + " -target "
+        #     + self.target
+        #     + " -trees "
+        #     + str(self.n_estimators)
+        #     + " -negPosRatio "
+        #     + str(self.neg_pos_ratio)
+        #     + " -utilityAlpha "
+        #     + str(self.utility_alpha)
+        #     + " 2>&1 | tee "
+        #     + str(self.file_system.files.TRAIN_LOG)
+        # )
+
+        # # Call the constructed command.
+        # self._call_shell_command(_CALL, ignoreSTDOUT = ignoreSTDOUT)
+
+        # # Read the trees from files.
+        # _estimators = []
+        # for _tree_number in range(self.n_estimators):
+        #     with open(
+        #         self.file_system.files.TREES_DIR.joinpath(
+        #             "{0}Tree{1}.tree".format(self.target, _tree_number)
+        #         )
+        #     ) as _fh:
+        #         _estimators.append(_fh.read())
+
+        # self._get_dotfiles()
+        # self.estimators_ = _estimators
+
+        # # TODO: Get training time. It can be extracted from the training output file. Where can we store this metric? Maybe we can store in `self._prediction_metrics`. In that case, is it better to change the name of this attribute to something like `_metrics`?
+
+        # return self
 
     def _run_inference(self, database, ignoreSTDOUT = True) -> None:
         """Run inference mode on the BoostSRL Jar files.

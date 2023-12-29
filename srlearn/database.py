@@ -210,7 +210,7 @@ class Database:
             if relationMapping.get(relation) is not None:
                 terms = [term.strip() for term in terms.split(",")]
                 for i, term in enumerate(terms):
-                    termTypeBeforeMapping = re.sub(r"[\+\-\#\s]", "", term)
+                    termTypeBeforeMapping = re.sub(r"[\+\-\#\`\@\s]", "", term)
                     termTypeAfterMapping = termTypeMapping.get(termTypeBeforeMapping)
                     terms[i] = term.replace(termTypeBeforeMapping, termTypeAfterMapping)
                 terms = ",".join(terms)
@@ -405,7 +405,7 @@ class Database:
         mapping = {targetRelation: recursionRelation}
         schema = database.extractSchemaPreds()
         for i in range(len(schema[targetRelation])):
-            arguments = [f"-{argumentType}" if j == i else f"+{argumentType}" for j, argumentType in enumerate(schema[targetRelation])]
+            arguments = [f"`{argumentType}" if j == i else f"+{argumentType}" for j, argumentType in enumerate(schema[targetRelation])]
             mode = f"{recursionRelation}({','.join(arguments)})."
             database.modes.append(mode)
         database.facts += utils.renameRelationsInPredicates(database.pos, mapping = mapping)
