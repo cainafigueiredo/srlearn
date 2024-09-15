@@ -4,9 +4,16 @@
 Relational Dependency Networks
 """
 
+# TODO: Check and update class and method descriptions
+# TODO: Use TreeBoostler as a dependent package
+# TODO: Extract learning and inference time for all models
+# TODO: Find a way to extract the mapping that TreeBoostler applies to the source model
+
 import os
 import re
 import sys
+import copy
+import shutil
 import pathlib
 import warnings
 import numpy as np
@@ -15,6 +22,8 @@ from .base import BaseBoostedRelationalModel
 from .database import TransferLearningDatabase, Database
 
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score 
+from typing import Union
+from glob import glob
 
 # TODO: Install TreeBoostler as a dependency and change how it is imported.
 PROJECT_DIR = os.path.dirname(__file__)
@@ -24,27 +33,29 @@ from TreeBoostler.revision import revision
 from TreeBoostler.tboostsrl import tboostsrl
 from TreeBoostler.transfer import transfer
 
+from .background import Background
+
 warnings.simplefilter("default")
 
 class RDNBoost(BaseBoostedRelationalModel):
     def __init__(
         self, 
         *, 
-        background = None, 
-        target = "None", 
         n_estimators = 10, 
         node_size = 2, 
         max_tree_depth = 3, 
         neg_pos_ratio = 2,
+        number_of_clauses: int = 8,
+        number_of_cycles: int = 100,
         path = None,
     ):
         super().__init__(
-            background = background, 
-            target = target, 
             n_estimators = n_estimators, 
             node_size = node_size, 
             max_tree_depth = max_tree_depth, 
             neg_pos_ratio = neg_pos_ratio, 
+            number_of_clauses = number_of_clauses,
+            number_of_cycles = number_of_cycles,
             solver = "BoostSRL",
             path = path
         )
@@ -52,48 +63,93 @@ class RDNBoost(BaseBoostedRelationalModel):
     def _check_params(self):
         super()._check_params()
 
+    def _callModel(
+        self,
+        database: Database,
+        trainOrTest = "train",
+        ignoreSTDOUT = True
+    ):
+        _jar = str(self.file_system.files.BOOSTSRL_BACKEND)
+
+        modes = database.modes
+        target = database.getTargetRelation()
+
+        background = Background(
+            modes = modes,
+            number_of_clauses = self.number_of_clauses,
+            number_of_cycles = self.number_of_cycles,
+            node_size = self.node_size,
+            max_tree_depth = self.max_tree_depth
+        )
+
+        if trainOrTest == "train":
+            background.write(
+                filename="train", location=self.file_system.files.TRAIN_DIR
+            )
+
+            database.write(
+                filename="train", location=self.file_system.files.TRAIN_DIR
+            )
+
+            _CALL = (
+                "java -jar "
+                + _jar
+                + " -l -train "
+                + str(self.file_system.files.TRAIN_DIR)
+                + " -target "
+                + target
+                + " -trees "
+                + str(self.n_estimators)
+                + " -negPosRatio "
+                + str(self.neg_pos_ratio)
+                + " 2>&1 | tee "
+                + str(self.file_system.files.TRAIN_LOG)
+            )
+        
+        else:
+            background.write(
+                filename="test", location=self.file_system.files.TEST_DIR
+            )
+
+            database.write(
+                filename="test", location=self.file_system.files.TEST_DIR
+            )
+
+            _CALL = (
+                "java -jar "
+                + _jar
+                + " -i -test "
+                + str(self.file_system.files.TEST_DIR)
+                + " -model "
+                + str(self.file_system.files.MODELS_DIR)
+                + " -target "
+                + target
+                + " -trees "
+                + str(self.n_estimators)
+                + " -aucJarPath "
+                + str(self.file_system.files.AUC_JAR)
+                + " 2>&1 | tee "
+                + str(self.file_system.files.TEST_LOG)
+            )
+
+        self._call_shell_command(_CALL, ignoreSTDOUT = ignoreSTDOUT)
+
     def fit(self, database, ignoreSTDOUT = True):
         self._check_params()
 
         if not isinstance(database, Database):
             raise ValueError("Database should be an instance of Database class.")
 
-        # Write the background to file.
-        self.background.write(
-            filename="train", location=self.file_system.files.TRAIN_DIR
-        )
+        target = database.getTargetRelation()
 
-        # Write the data to files.
-        database.write(
-            filename="train", location=self.file_system.files.TRAIN_DIR
-        )
-
-        _jar = str(self.file_system.files.BOOSTSRL_BACKEND)
-
-        _CALL = (
-            "java -jar "
-            + _jar
-            + " -l -train "
-            + str(self.file_system.files.TRAIN_DIR)
-            + " -target "
-            + self.target
-            + " -trees "
-            + str(self.n_estimators)
-            + " -negPosRatio "
-            + str(self.neg_pos_ratio)
-            + " 2>&1 | tee "
-            + str(self.file_system.files.TRAIN_LOG)
-        )
-
-        # Call the constructed command.
-        self._call_shell_command(_CALL, ignoreSTDOUT = ignoreSTDOUT)
+        self._callModel(database, trainOrTest = "train", ignoreSTDOUT = ignoreSTDOUT)
 
         # Read the trees from files.
         _estimators = []
         for _tree_number in range(self.n_estimators):
             with open(
                 self.file_system.files.TREES_DIR.joinpath(
-                    "{0}Tree{1}.tree".format(self.target, _tree_number)
+                    "{0}Tree{1}.tree".format(target, _tree_number)
                 )
             ) as _fh:
                 _estimators.append(_fh.read())
@@ -105,7 +161,7 @@ class RDNBoost(BaseBoostedRelationalModel):
 
         return self
 
-    def _run_inference(self, database, ignoreSTDOUT = True) -> None:
+    def _run_inference(self, database, ignoreSTDOUT = True) -> dict:
         """Run inference mode on the BoostSRL Jar files.
 
         This is a helper method for ``self.predict`` and ``self.predict_proba``
@@ -113,34 +169,11 @@ class RDNBoost(BaseBoostedRelationalModel):
 
         self._check_initialized()
 
-        # Write the background to file.
-        self.background.write(
-            filename="test", location=self.file_system.files.TEST_DIR
+        self._callModel(
+            database,
+            trainOrTest = "test",
+            ignoreSTDOUT = ignoreSTDOUT
         )
-
-        # Write the data to files.
-        database.write(filename="test", location=self.file_system.files.TEST_DIR)
-       
-        _jar = str(self.file_system.files.BOOSTSRL_BACKEND)
-
-        _CALL = (
-            "java -jar "
-            + _jar
-            + " -i -test "
-            + str(self.file_system.files.TEST_DIR)
-            + " -model "
-            + str(self.file_system.files.MODELS_DIR)
-            + " -target "
-            + self.target
-            + " -trees "
-            + str(self.n_estimators)
-            + " -aucJarPath "
-            + str(self.file_system.files.AUC_JAR)
-            + " 2>&1 | tee "
-            + str(self.file_system.files.TEST_LOG)
-        )
-
-        self._call_shell_command(_CALL, ignoreSTDOUT = ignoreSTDOUT)
 
         # Read the threshold
         with open(self.file_system.files.TEST_LOG, "r") as _fh:
@@ -153,6 +186,14 @@ class RDNBoost(BaseBoostedRelationalModel):
             self._prediction_metrics["prec"] = re.findall(r".*Precision.*= (\d*\.?\d*).*", log)[0]
             self._prediction_metrics["rec"] = re.findall(r".*Recall.*= (\d*\.?\d*)", log)[0]
             self._prediction_metrics["f1"] = re.findall(r"\%.*F1.*= (\d*\.?\d*)", log)[0]
+
+            self._prediction_metrics["threshold"] = self._prediction_metrics["threshold"] if self._prediction_metrics["threshold"] != "" else "nan"
+            self._prediction_metrics["cll"] = self._prediction_metrics["cll"] if self._prediction_metrics["cll"] != "" else "nan"
+            self._prediction_metrics["aucROC"] = self._prediction_metrics["aucROC"] if self._prediction_metrics["aucROC"] != "" else "nan"
+            self._prediction_metrics["aucPR"] = self._prediction_metrics["aucPR"] if self._prediction_metrics["aucPR"] != "" else "nan"
+            self._prediction_metrics["prec"] = self._prediction_metrics["prec"] if self._prediction_metrics["prec"] != "" else "nan"
+            self._prediction_metrics["rec"] = self._prediction_metrics["rec"] if self._prediction_metrics["rec"] != "" else "nan"
+            self._prediction_metrics["f1"] = self._prediction_metrics["f1"] if self._prediction_metrics["f1"] != "" else "nan"
             # TODO: Get inference time. It can be extracted from the same file from which the metrics above were extracted.
 
     def predict(self, database, threshold = None, ignoreSTDOUT = True):
@@ -186,6 +227,11 @@ class RDNBoost(BaseBoostedRelationalModel):
             self._prediction_metrics["rec"] = recall_score(trueLabels, predictedLabels)
             self._prediction_metrics["f1"] = f1_score(trueLabels, predictedLabels)
 
+            self._prediction_metrics["acc"] = self._prediction_metrics["acc"] if self._prediction_metrics["acc"] != "" else "nan"
+            self._prediction_metrics["prec"] = self._prediction_metrics["prec"] if self._prediction_metrics["prec"] != "" else "nan"
+            self._prediction_metrics["rec"] = self._prediction_metrics["rec"] if self._prediction_metrics["rec"] != "" else "nan"
+            self._prediction_metrics["f1"] = self._prediction_metrics["f1"] if self._prediction_metrics["f1"] != "" else "nan"
+
         return predictedLabels
 
     def predict_proba(self, database, ignoreSTDOUT = True):
@@ -204,8 +250,10 @@ class RDNBoost(BaseBoostedRelationalModel):
 
         self._run_inference(database, ignoreSTDOUT = ignoreSTDOUT)
 
+        target = database.getTargetRelation()
+
         _results_db = self.file_system.files.TEST_DIR.joinpath(
-            "results_" + self.target + ".db"
+            "results_" + target + ".db"
         )
         _classes, _results = np.genfromtxt(
             _results_db,
@@ -227,23 +275,21 @@ class RDNBoostTransferLearning(BaseBoostedRelationalModel):
     def __init__(
         self,
         *,
-        background = None,
-        target = "None",
         n_estimators = 10,
         node_size = 2,
         max_tree_depth = 3,
         neg_pos_ratio = 2,
-        utility_alpha = 1,
+        number_of_clauses: int = 8,
+        number_of_cycles: int = 100,
+        source_utility_alpha = 1,
+        target_utility_alpha = 1,
+        utility_alpha_set_iter = 1,
         path = None
     ):
         """Initialize a BoostedRDN Transfer Learner
 
         Parameters
         ----------
-        background : :class:`srlearn.background.Background` (default: None)
-            Background knowledge with respect to the database
-        target : str (default: "None")
-            Target predicate to learn
         n_estimators : int, optional (default: 10)
             Number of trees to fit
         node_size : int, optional (default: 2)
@@ -252,8 +298,12 @@ class RDNBoostTransferLearning(BaseBoostedRelationalModel):
             Maximum number of nodes from root to leaf (height) in the tree.
         neg_pos_ratio : int or float, optional (default: 2)
             Ratio of negative to positive examples used during learning.
-        utility_alpha : float, optional (default: 1)
-            Alpha hyperparameter for alpha-fairness utility function.
+        source_utility_alpha : float, optional (default: 1)
+            Source alpha hyperparameter for alpha-fairness utility function.
+        target_utility_alpha : float, optional (default: 1)
+            Target alpha hyperparameter for alpha-fairness utility function.
+        utility_alpha_set_iter : int, optional (default: 1)
+            Learning iteration where source utility alpha and target utility alpha will be set to `source_utility_alpha` and `target_utility_alpha`, respectively. Before this iteration, both of them will be set to 1.
             
         Attributes
         ----------
@@ -264,66 +314,123 @@ class RDNBoostTransferLearning(BaseBoostedRelationalModel):
         """
 
         super().__init__(
-            background = background,
-            target = target,
             n_estimators = n_estimators,
             node_size = node_size,
             max_tree_depth = max_tree_depth,
             neg_pos_ratio = neg_pos_ratio,
+            number_of_clauses = number_of_clauses,
+            number_of_cycles = number_of_cycles,
             solver = "BoostSRLTransferLearner",
             path = path
         )
-        self.utility_alpha = utility_alpha
+        self.source_utility_alpha = source_utility_alpha
+        self.target_utility_alpha = target_utility_alpha
+        self.utility_alpha_set_iter = utility_alpha_set_iter
 
     def _check_params(self):
-        if not (self.utility_alpha >= 0):
-            raise ValueError("Alpha for alpha-fairness should be greater than or equal to zero.")
+        if not (self.source_utility_alpha >= 0):
+            raise ValueError("Source alpha for alpha-fairness should be greater than or equal to zero.")
+        if not (self.target_utility_alpha >= 0):
+            raise ValueError("Target alpha for alpha-fairness should be greater than or equal to zero.")
         super()._check_params()
 
-    def fit(self, database, ignoreSTDOUT = True):
+    def _callModel(
+        self,
+        database: Union[Database,TransferLearningDatabase],
+        trainOrTest = "train",
+        ignoreSTDOUT = True
+    ):
+        _jar = str(self.file_system.files.BOOSTSRL_TRANFER_LEARNER_BACKEND)
+
+        modes = database.modes
+        target = database.getTargetRelation()
+
+        background = Background(
+            modes = modes,
+            number_of_clauses = self.number_of_clauses,
+            number_of_cycles = self.number_of_cycles,
+            node_size = self.node_size,
+            max_tree_depth = self.max_tree_depth
+        )
+
+        if trainOrTest == "train":
+            background.write(
+                filename="train", location=self.file_system.files.TRAIN_DIR
+            )
+
+            database.write(
+                filename="train", location=self.file_system.files.TRAIN_DIR
+            )
+
+            _CALL = (
+                "java -jar "
+                + _jar
+                + " -l -train "
+                + str(self.file_system.files.TRAIN_DIR)
+                + " -target "
+                + target
+                + " -trees "
+                + str(self.n_estimators)
+                + " -negPosRatio "
+                + str(self.neg_pos_ratio)
+                + " -sourceUtilityAlpha "
+                + str(self.source_utility_alpha)
+                + " -targetUtilityAlpha "
+                + str(self.target_utility_alpha)
+                + " -utilityAlphaSetIter "
+                + str(self.utility_alpha_set_iter)
+                + " 2>&1 | tee "
+                + str(self.file_system.files.TRAIN_LOG)
+            )
+        
+        else:
+            background.write(
+                filename="test", location=self.file_system.files.TEST_DIR
+            )
+
+            database.write(
+                filename="test", location=self.file_system.files.TEST_DIR
+            )
+
+            _CALL = (
+                "java -jar "
+                + _jar
+                + " -i -test "
+                + str(self.file_system.files.TEST_DIR)
+                + " -model "
+                + str(self.file_system.files.MODELS_DIR)
+                + " -target "
+                + target
+                + " -trees "
+                + str(self.n_estimators)
+                + " -aucJarPath "
+                + str(self.file_system.files.AUC_JAR)
+                + " 2>&1 | tee "
+                + str(self.file_system.files.TEST_LOG)
+            )
+
+        self._call_shell_command(_CALL, ignoreSTDOUT = ignoreSTDOUT)
+
+    def fit(self, database: TransferLearningDatabase, ignoreSTDOUT = True):
         self._check_params()
 
         if not isinstance(database, TransferLearningDatabase):
             raise ValueError("Database should be an instance of TransferLearningDatabase class.")
 
-        # Write the background to file.
-        self.background.write(
-            filename="train", location=self.file_system.files.TRAIN_DIR
+        target = database.getTargetRelation()
+
+        self._callModel(
+            database,
+            trainOrTest = "train",
+            ignoreSTDOUT = ignoreSTDOUT
         )
-
-        # Write the data to files.
-        database.write(
-            filename="train", location=self.file_system.files.TRAIN_DIR
-        )
-
-        _jar = str(self.file_system.files.BOOSTSRL_TRANFER_LEARNER_BACKEND)
-
-        _CALL = (
-            "java -jar "
-            + _jar
-            + " -l -train "
-            + str(self.file_system.files.TRAIN_DIR)
-            + " -target "
-            + self.target
-            + " -trees "
-            + str(self.n_estimators)
-            + " -negPosRatio "
-            + str(self.neg_pos_ratio)
-            + " -utilityAlpha "
-            + str(self.utility_alpha)
-            + " 2>&1 | tee "
-            + str(self.file_system.files.TRAIN_LOG)
-        )
-
-        # Call the constructed command.
-        self._call_shell_command(_CALL, ignoreSTDOUT = ignoreSTDOUT)
 
         # Read the trees from files.
         _estimators = []
         for _tree_number in range(self.n_estimators):
             with open(
                 self.file_system.files.TREES_DIR.joinpath(
-                    "{0}Tree{1}.tree".format(self.target, _tree_number)
+                    "{0}Tree{1}.tree".format(target, _tree_number)
                 )
             ) as _fh:
                 _estimators.append(_fh.read())
@@ -335,7 +442,7 @@ class RDNBoostTransferLearning(BaseBoostedRelationalModel):
 
         return self
 
-    def _run_inference(self, database, ignoreSTDOUT = True) -> None:
+    def _run_inference(self, database: Database, ignoreSTDOUT = True) -> dict:
         """Run inference mode on the BoostSRL Jar files.
 
         This is a helper method for ``self.predict`` and ``self.predict_proba``
@@ -343,34 +450,11 @@ class RDNBoostTransferLearning(BaseBoostedRelationalModel):
 
         self._check_initialized()
 
-        # Write the background to file.
-        self.background.write(
-            filename="test", location=self.file_system.files.TEST_DIR
+        self._callModel(
+            database, 
+            trainOrTest = "test",
+            ignoreSTDOUT = ignoreSTDOUT 
         )
-
-        # Write the data to files.
-        database.write(filename="test", location=self.file_system.files.TEST_DIR)
-       
-        _jar = str(self.file_system.files.BOOSTSRL_TRANFER_LEARNER_BACKEND)
-
-        _CALL = (
-            "java -jar "
-            + _jar
-            + " -i -test "
-            + str(self.file_system.files.TEST_DIR)
-            + " -model "
-            + str(self.file_system.files.MODELS_DIR)
-            + " -target "
-            + self.target
-            + " -trees "
-            + str(self.n_estimators)
-            + " -aucJarPath "
-            + str(self.file_system.files.AUC_JAR)
-            + " 2>&1 | tee "
-            + str(self.file_system.files.TEST_LOG)
-        )
-
-        self._call_shell_command(_CALL, ignoreSTDOUT = ignoreSTDOUT)
 
         # Read the threshold
         with open(self.file_system.files.TEST_LOG, "r") as _fh:
@@ -383,8 +467,16 @@ class RDNBoostTransferLearning(BaseBoostedRelationalModel):
             self._prediction_metrics["prec"] = re.findall(r".*Precision.*= (\d*\.?\d*).*", log)[0]
             self._prediction_metrics["rec"] = re.findall(r".*Recall.*= (\d*\.?\d*)", log)[0]
             self._prediction_metrics["f1"] = re.findall(r"\%.*F1.*= (\d*\.?\d*)", log)[0]
-            # TODO: Get inference time. It can be extracted from the same file from which the metrics above were extracted.
 
+            self._prediction_metrics["threshold"] = self._prediction_metrics["threshold"] if self._prediction_metrics["threshold"] != "" else "nan"
+            self._prediction_metrics["cll"] = self._prediction_metrics["cll"] if self._prediction_metrics["cll"] != "" else "nan"
+            self._prediction_metrics["aucROC"] = self._prediction_metrics["aucROC"] if self._prediction_metrics["aucROC"] != "" else "nan"
+            self._prediction_metrics["aucPR"] = self._prediction_metrics["aucPR"] if self._prediction_metrics["aucPR"] != "" else "nan"
+            self._prediction_metrics["prec"] = self._prediction_metrics["prec"] if self._prediction_metrics["prec"] != "" else "nan"
+            self._prediction_metrics["rec"] = self._prediction_metrics["rec"] if self._prediction_metrics["rec"] != "" else "nan"
+            self._prediction_metrics["f1"] = self._prediction_metrics["f1"] if self._prediction_metrics["f1"] != "" else "nan"
+            # TODO: Get inference time. It can be extracted from the same file from which the metrics above were extracted.
+        
     def predict(self, database, threshold = None, ignoreSTDOUT = True):
         """Use the learned model to predict on new data.
 
@@ -416,6 +508,11 @@ class RDNBoostTransferLearning(BaseBoostedRelationalModel):
             self._prediction_metrics["rec"] = recall_score(trueLabels, predictedLabels)
             self._prediction_metrics["f1"] = f1_score(trueLabels, predictedLabels)
 
+            self._prediction_metrics["acc"] = self._prediction_metrics["acc"] if self._prediction_metrics["acc"] != "" else "nan"
+            self._prediction_metrics["prec"] = self._prediction_metrics["prec"] if self._prediction_metrics["prec"] != "" else "nan"
+            self._prediction_metrics["rec"] = self._prediction_metrics["rec"] if self._prediction_metrics["rec"] != "" else "nan"
+            self._prediction_metrics["f1"] = self._prediction_metrics["f1"] if self._prediction_metrics["f1"] != "" else "nan"
+
         return predictedLabels
 
     def predict_proba(self, database, ignoreSTDOUT = True):
@@ -433,9 +530,10 @@ class RDNBoostTransferLearning(BaseBoostedRelationalModel):
         """
 
         self._run_inference(database, ignoreSTDOUT = ignoreSTDOUT)
+        target = database.getTargetRelation()
 
         _results_db = self.file_system.files.TEST_DIR.joinpath(
-            "results_" + self.target + ".db"
+            "results_" + target + ".db"
         )
         _classes, _results = np.genfromtxt(
             _results_db,
@@ -457,41 +555,197 @@ class TreeBoostler(BaseBoostedRelationalModel):
     def __init__(
         self,
         *,
-        sourceBackground = None,
-        targetBackground = None,
         searchArgPermutation: bool = True,
-
-        target = "None",
-        n_estimators = 10,
-        node_size = 2,
-        max_tree_depth = 3,
-        neg_pos_ratio = 2,
-        utility_alpha = 1,
+        allowSameTargetMap: bool = False,
+        refine: bool = True,
+        maxRevisionIterations: int = 1,
+        n_estimators: int = 10,
+        node_size: int = 2,
+        max_tree_depth: int = 3,
+        neg_pos_ratio: int = 2,
+        number_of_clauses: int = 8,
+        number_of_cycles: int = 100,
         path = None
     ):
         # TODO: Add a description to the class.
 
         super().__init__(
-            background = None,
-            target = target,
             n_estimators = n_estimators,
             node_size = node_size,
             max_tree_depth = max_tree_depth,
             neg_pos_ratio = neg_pos_ratio,
-            solver = "BoostSRLTransferLearner",
+            number_of_clauses = number_of_clauses,
+            number_of_cycles = number_of_cycles,
+            solver = "TreeBoostler",
             path = path
         )
-        self.utility_alpha = utility_alpha
-        self.sourceBackground = sourceBackground
-        self.targetBackground = targetBackground
         self.searchArgPermutation = searchArgPermutation
+        self.allowSameTargetMap = allowSameTargetMap
+        self.refine = refine
+        self.maxRevisionIterations = maxRevisionIterations
 
     def _check_params(self):
-        if not (self.utility_alpha >= 0):
-            raise ValueError("Alpha for alpha-fairness should be greater than or equal to zero.")
         super()._check_params()
 
-    def fit(self, sourceDatabase: Database, targetDatabase: Database, ignoreSTDOUT = True):
+    def _callModel(
+        self,
+        database: Database,
+        transferFile = None,
+        refine = None,
+        trainOrTest = "train",
+        ignoreSTDOUT = True
+    ):
+        _jar = str(self.file_system.files.TREEBOOSTLER_BACKEND)
+
+        modes = database.modes
+        target = database.getTargetRelation()
+
+        background = Background(
+            modes = modes,
+            number_of_clauses = self.number_of_clauses,
+            number_of_cycles = self.number_of_cycles,
+            node_size = self.node_size,
+            max_tree_depth = self.max_tree_depth
+        )
+
+        if trainOrTest == "train":
+            background.write(
+                filename="train", location=self.file_system.files.TRAIN_DIR
+            )
+
+            database.write(
+                filename="train", location=self.file_system.files.TRAIN_DIR
+            )
+
+            if refine:
+                with open(os.path.join(str(self.file_system.files.DIRECTORY), "refine.txt"), "w") as f:
+                    f.write("\n".join(refine))
+                    f.write("\n")
+
+            if transferFile:
+                with open(os.path.join(str(self.file_system.files.DIRECTORY), "transfer.txt"), "w") as f:
+                    f.write("\n".join(transferFile))
+                    f.write("\n")
+
+            _CALL = (
+                "java -jar "
+                + _jar
+                + " -l -train "
+                + str(self.file_system.files.TRAIN_DIR)
+                + (' -refine refine.txt ' if refine else '' )
+                + (' -transfer transfer.txt ' if transferFile else '')
+                + " -target "
+                + target
+                + " -trees "
+                + str(self.n_estimators)
+                + " -negPosRatio "
+                + str(self.neg_pos_ratio)
+                + " 2>&1 | tee "
+                + str(self.file_system.files.TRAIN_LOG)
+            )
+        
+        else:
+            background.write(
+                filename="test", location=self.file_system.files.TEST_DIR
+            )
+
+            database.write(
+                filename="test", location=self.file_system.files.TEST_DIR
+            )
+
+            _CALL = (
+                "java -jar "
+                + _jar
+                + " -i -test "
+                + str(self.file_system.files.TEST_DIR)
+                + " -model "
+                + str(self.file_system.files.MODELS_DIR)
+                + " -target "
+                + target
+                + " -trees "
+                + str(self.n_estimators)
+                + " -aucJarPath "
+                + str(self.file_system.files.AUC_JAR)
+                + " 2>&1 | tee "
+                + str(self.file_system.files.TEST_LOG)
+            )
+
+        self._call_shell_command(_CALL, ignoreSTDOUT = ignoreSTDOUT)
+
+    def _get_structured_tree(self, treenumber=1):
+        '''Use the get_will_produced_tree function to get the WILL-Produced Tree #1
+           and returns it as objects with nodes, std devs and number of examples reached.'''
+        def get_results(groups):
+            #std dev, neg, pos
+            # std dev with comma, is this supposed to happen?
+            ret = [float(groups[0].replace(',','.')), 0, 0]
+            if len(groups) > 1:
+                match = re.findall(r'\#pos=([\d.]*).*', groups[1])
+                if match:
+                    ret[2] = int(match[0].replace('.',''))
+                match = re.findall(r'\#neg=([\d.]*)', groups[1])
+                if match:
+                    ret[1] = int(match[0].replace('.',''))
+            return ret
+
+        lines = self._get_will_produced_tree(treenumber=treenumber)
+        current = []
+        stack = []
+        target = None
+        nodes = {}
+        leaves = {}
+
+        for line in lines:
+            if not target:
+                match = re.match('\s*\%\s*FOR\s*(\w+\([\w,\s]*\)):', line)
+                if match:
+                    target = match.group(1)
+            match = re.match('.*if\s*\(\s*([\w\(\),\s]*)\s*\).*', line)
+            if match:
+                nodes[','.join(current)] = match.group(1).strip()
+                stack.append(current+['false'])
+                current.append('true')
+            match = re.match('.*[then|else] return .*;\s*\/\/\s*std dev\s*=\s*([\d,.\-e]*),.*\/\*\s*(.*)\s*\*\/.*', line)
+            if match:
+                leaves[','.join(current)] = get_results(match.groups()) #float(match.group(1))
+                if len(stack):
+                    current = stack.pop()
+            else:
+                match = re.match('.*[then|else] return .*;\s*\/\/\s*.*', line)
+                if match:
+                    leaves[','.join(current)] = get_results(['0'] + list(match.groups())) #float(match.group(1))
+                    if len(stack):
+                        current = stack.pop()
+        return [target, nodes, leaves]
+
+    def _get_will_produced_tree(self, treenumber = 1):
+        '''Return the WILL-Produced Tree'''
+        combine = 'Combined' if self.n_estimators > 1 and treenumber=='combine' else '#' + str(treenumber)
+        willTreesFilePath = glob(f'{str(self.file_system.files.MODELS_DIR)}/WILLtheories/*_learnedWILLregressionTrees.txt')[0]
+        with open(willTreesFilePath, 'r') as f:
+            text = f.read()
+        line = re.findall(r'%%%%%  WILL-Produced Tree '+ combine +' .* %%%%%[\s\S]*% Clauses:', text)
+        splitline = (line[0].split('\n'))[2:]
+        for i in range(len(splitline)):
+            if splitline[i] == '% Clauses:':
+                return splitline[:i-2]
+
+    def _get_variances(self, treenumber = 1):
+        '''Return variances of nodes'''
+        with open(f'{str(self.file_system.files.TRAIN_DIR)}/train_learn_dribble.txt', 'r') as f:
+            text = f.read()
+        line = re.findall(r'% Path: '+ str(treenumber-1) + ';([\w,]*)\sComparing variance: ([\d.\w\-]*) .*\sComparing variance: ([\d.\w\-]*) .*', text)
+        ret = {}
+        for item in line:
+            ret[item[0]] = [float(item[1]), float(item[2])]
+        return ret
+
+    def fit(
+        self, 
+        sourceDatabase: Database, 
+        targetDatabase: Database, 
+        ignoreSTDOUT = True
+    ):
         self._check_params()
 
         if not isinstance(sourceDatabase, Database):
@@ -500,149 +754,140 @@ class TreeBoostler(BaseBoostedRelationalModel):
         if not isinstance(targetDatabase, Database):
             raise ValueError("Target database should be an instance of Database class.")
 
-        sourceDomainTargetPredicate = sourceDatabase.getTargetRelation()
-        self.sourceBackground.write("background", pathlib.Path("./tboostsrl"))
-        os.system("mv ./tboostsrl/background_bk.txt ./tboostsrl/background.txt")
-        self.sourceBackground.target = [sourceDomainTargetPredicate]
-
+        # Learning model from source domain
         sourceDomainTargetPredicate = sourceDatabase.getTargetRelation()
 
-        revision.learn_model(
-            self.sourceBackground, 
-            tboostsrl, 
-            sourceDomainTargetPredicate, 
-            sourceDatabase.pos, 
-            sourceDatabase.neg, 
-            sourceDatabase.facts, 
-            refine=None, 
-            trees=self.neg_pos_ratio
+        sourceModes = sourceDatabase.modes
+
+        self._callModel(
+            sourceDatabase,
+            transferFile = None, 
+            refine = None,
+            trainOrTest = "train",
+            ignoreSTDOUT = ignoreSTDOUT
         )
 
-        learnResults = revision.learn_model(
-            self.sourceBackground, 
-            tboostsrl, 
-            sourceDomainTargetPredicate, 
-            sourceDatabase.pos,
-            sourceDatabase.neg, 
-            sourceDatabase.facts, 
-            refine = None, 
-            trees = self.n_estimators
-        )
-        
-        model, totalRevisionTime, sourceStructured, will, variances = learnResults
+        sourceStructure = []
+        for i in range(self.n_estimators):
+            sourceStructure.append(self._get_structured_tree(treenumber=i+1).copy())
 
+        # Transfer source model and refining it
         targetDomainTargetPredicate = targetDatabase.getTargetRelation()
-        self.targetBackground.write("background", pathlib.Path("./tboostsrl"))
-        os.system("mv ./tboostsrl/background_bk.txt ./tboostsrl/background.txt")
-        self.targetBackground.target = [targetDomainTargetPredicate]
 
-        transferredStructured = sourceStructured
+        targetModes = targetDatabase.modes
+    
         transferFile = transfer.get_transfer_file(
-            sourceDatabase.modes, 
-            targetDatabase.modes,
-            sourceDomainTargetPredicate, 
-            targetDomainTargetPredicate, 
+            sourceModes, 
+            targetModes, 
+            sourceDomainTargetPredicate,
+            targetDomainTargetPredicate,
             searchArgPermutation = self.searchArgPermutation,
             allowSameTargetMap = self.allowSameTargetMap
         )
 
-        revisionResults = revision.theory_revision(
-            self.targetBackground, 
-            tboostsrl, 
-            targetDomainTargetPredicate, 
-            targetDatabase.pos, 
-            targetDatabase.neg, 
-            targetDatabase.facts,
-            targetDatabaseTest.pos, 
-            targetDatabaseTest.neg, 
-            targetDatabaseTest.facts,
-            transferredStructured, 
-            transfer = transferFile, 
-            trees = self.n_estimators, 
-            max_revision_iterations = self.maxRevisionIterations
+        refine = revision.get_boosted_refine_file(sourceStructure) if self.refine else None
+
+        self._saveModelFilesBackup("best")
+
+        self._callModel(
+            targetDatabase,
+            transferFile = transferFile, 
+            refine = refine,
+            trainOrTest = "train",
+            ignoreSTDOUT = ignoreSTDOUT
         )
-        model, tResults, structured, plTRresults = revisionResults
 
-        # # Write the data to files.
-        # database.write(
-        #     filename="train", location=self.file_system.files.TRAIN_DIR
-        # )
+        self._run_inference(
+            targetDatabase,
+            ignoreSTDOUT = ignoreSTDOUT
+        )
+        trainPredictionMetrics = copy.deepcopy(self._prediction_metrics)
 
-        # _jar = str(self.file_system.files.BOOSTSRL_TRANFER_LEARNER_BACKEND)
+        targetStructure = []
+        for i in range(self.n_estimators):
+            targetStructure.append(self._get_structured_tree(treenumber=i+1).copy())
 
-        # _CALL = (
-        #     "java -jar "
-        #     + _jar
-        #     + " -l -train "
-        #     + str(self.file_system.files.TRAIN_DIR)
-        #     + " -target "
-        #     + self.target
-        #     + " -trees "
-        #     + str(self.n_estimators)
-        #     + " -negPosRatio "
-        #     + str(self.neg_pos_ratio)
-        #     + " -utilityAlpha "
-        #     + str(self.utility_alpha)
-        #     + " 2>&1 | tee "
-        #     + str(self.file_system.files.TRAIN_LOG)
-        # )
+        bestStructure = copy.deepcopy(targetStructure)
+        bestResults = copy.deepcopy(trainPredictionMetrics)
+        bestCLL = float(bestResults['cll'])
+        variances = [self._get_variances(treenumber=i+1) for i in range(self.n_estimators)]
 
-        # # Call the constructed command.
-        # self._call_shell_command(_CALL, ignoreSTDOUT = ignoreSTDOUT)
+        self._saveModelFilesBackup("best")
 
-        # # Read the trees from files.
-        # _estimators = []
-        # for _tree_number in range(self.n_estimators):
-        #     with open(
-        #         self.file_system.files.TREES_DIR.joinpath(
-        #             "{0}Tree{1}.tree".format(self.target, _tree_number)
-        #         )
-        #     ) as _fh:
-        #         _estimators.append(_fh.read())
+        if self.refine:
+            for revisionIter in range(self.maxRevisionIterations):
+                found_better = False
+                candidate = revision.get_boosted_candidate(bestStructure, variances)
+                if not len(candidate):
+                    candidate = revision.get_boosted_candidate(bestStructure, variances, no_pruning=True)
 
-        # self._get_dotfiles()
-        # self.estimators_ = _estimators
+                self._callModel(
+                    targetDatabase,
+                    transferFile = None, 
+                    refine = candidate,
+                    ignoreSTDOUT = ignoreSTDOUT
+                )
 
-        # # TODO: Get training time. It can be extracted from the training output file. Where can we store this metric? Maybe we can store in `self._prediction_metrics`. In that case, is it better to change the name of this attribute to something like `_metrics`?
+                self._run_inference(
+                    targetDatabase,
+                    ignoreSTDOUT = ignoreSTDOUT
+                )
+                predictionMetrics = copy.deepcopy(self._prediction_metrics)
+                curCLL = float(predictionMetrics["cll"])
 
-        # return self
+                if curCLL > bestCLL:
+                    found_better = True
+                    bestCLL = float(predictionMetrics['cll'])
+                    bestStructure = []
+                    for i in range(self.n_estimators):
+                        bestStructure.append(self._get_structured_tree(treenumber=i+1).copy())
+                    bestResults = copy.deepcopy(predictionMetrics)
+                    self._saveModelFilesBackup("best")
 
-    def _run_inference(self, database, ignoreSTDOUT = True) -> None:
+                else: 
+                    self._cleanModelFiles()
+
+                if found_better == False:
+                    break
+
+        # Read the trees from files.
+        _estimators = []
+        for _tree_number in range(self.n_estimators):
+            with open(
+                os.path.join(
+                    str(self.file_system.files.DIRECTORY), 
+                    "best/train/models/bRDNs/Trees",
+                    "{0}Tree{1}.tree".format(targetDomainTargetPredicate, _tree_number)
+                )
+            ) as _fh:
+                _estimators.append(_fh.read())
+
+        self._get_dotfiles()
+        self.estimators_ = _estimators
+
+        del self._prediction_metrics
+
+        self._restoreModelFromBackup("best")
+
+        return self
+
+    def _run_inference(
+        self, 
+        database: Database,
+        ignoreSTDOUT = True
+    ) -> dict:
         """Run inference mode on the BoostSRL Jar files.
 
         This is a helper method for ``self.predict`` and ``self.predict_proba``
         """
 
-        self._check_initialized()
-
-        # Write the background to file.
-        self.background.write(
-            filename="test", location=self.file_system.files.TEST_DIR
+        self._callModel(
+            database,
+            transferFile = None, 
+            refine = None,
+            trainOrTest = "test",
+            ignoreSTDOUT = ignoreSTDOUT
         )
-
-        # Write the data to files.
-        database.write(filename="test", location=self.file_system.files.TEST_DIR)
-       
-        _jar = str(self.file_system.files.BOOSTSRL_TRANFER_LEARNER_BACKEND)
-
-        _CALL = (
-            "java -jar "
-            + _jar
-            + " -i -test "
-            + str(self.file_system.files.TEST_DIR)
-            + " -model "
-            + str(self.file_system.files.MODELS_DIR)
-            + " -target "
-            + self.target
-            + " -trees "
-            + str(self.n_estimators)
-            + " -aucJarPath "
-            + str(self.file_system.files.AUC_JAR)
-            + " 2>&1 | tee "
-            + str(self.file_system.files.TEST_LOG)
-        )
-
-        self._call_shell_command(_CALL, ignoreSTDOUT = ignoreSTDOUT)
 
         # Read the threshold
         with open(self.file_system.files.TEST_LOG, "r") as _fh:
@@ -655,6 +900,14 @@ class TreeBoostler(BaseBoostedRelationalModel):
             self._prediction_metrics["prec"] = re.findall(r".*Precision.*= (\d*\.?\d*).*", log)[0]
             self._prediction_metrics["rec"] = re.findall(r".*Recall.*= (\d*\.?\d*)", log)[0]
             self._prediction_metrics["f1"] = re.findall(r"\%.*F1.*= (\d*\.?\d*)", log)[0]
+
+            self._prediction_metrics["threshold"] = self._prediction_metrics["threshold"] if self._prediction_metrics["threshold"] != "" else "nan"
+            self._prediction_metrics["cll"] = self._prediction_metrics["cll"] if self._prediction_metrics["cll"] != "" else "nan"
+            self._prediction_metrics["aucROC"] = self._prediction_metrics["aucROC"] if self._prediction_metrics["aucROC"] != "" else "nan"
+            self._prediction_metrics["aucPR"] = self._prediction_metrics["aucPR"] if self._prediction_metrics["aucPR"] != "" else "nan"
+            self._prediction_metrics["prec"] = self._prediction_metrics["prec"] if self._prediction_metrics["prec"] != "" else "nan"
+            self._prediction_metrics["rec"] = self._prediction_metrics["rec"] if self._prediction_metrics["rec"] != "" else "nan"
+            self._prediction_metrics["f1"] = self._prediction_metrics["f1"] if self._prediction_metrics["f1"] != "" else "nan"
             # TODO: Get inference time. It can be extracted from the same file from which the metrics above were extracted.
 
     def predict(self, database, threshold = None, ignoreSTDOUT = True):
@@ -688,6 +941,11 @@ class TreeBoostler(BaseBoostedRelationalModel):
             self._prediction_metrics["rec"] = recall_score(trueLabels, predictedLabels)
             self._prediction_metrics["f1"] = f1_score(trueLabels, predictedLabels)
 
+            self._prediction_metrics["acc"] = self._prediction_metrics["acc"] if self._prediction_metrics["acc"] != "" else "nan"
+            self._prediction_metrics["prec"] = self._prediction_metrics["prec"] if self._prediction_metrics["prec"] != "" else "nan"
+            self._prediction_metrics["rec"] = self._prediction_metrics["rec"] if self._prediction_metrics["rec"] != "" else "nan"
+            self._prediction_metrics["f1"] = self._prediction_metrics["f1"] if self._prediction_metrics["f1"] != "" else "nan"
+
         return predictedLabels
 
     def predict_proba(self, database, ignoreSTDOUT = True):
@@ -706,8 +964,10 @@ class TreeBoostler(BaseBoostedRelationalModel):
 
         self._run_inference(database, ignoreSTDOUT = ignoreSTDOUT)
 
+        target = database.getTargetRelation()
+
         _results_db = self.file_system.files.TEST_DIR.joinpath(
-            "results_" + self.target + ".db"
+            "results_" + target + ".db"
         )
         _classes, _results = np.genfromtxt(
             _results_db,

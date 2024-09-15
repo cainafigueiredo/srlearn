@@ -58,3 +58,78 @@ def renameRelationsInPredicates(predicates: list, mapping: dict):
             predicate = f"{newRelation}({','.join(terms)})."
         renamedPredicates.append(predicate)
     return renamedPredicates
+
+def cleanPreds(preds):
+    '''Clean +, -, and # from modes'''
+    ret = set()
+    for line in preds:
+        m = re.search('^(\w+)\(([\w, +\-\#\`]+)*\).$', line)
+        if m:
+            relation = m.group(1)
+            relation = re.sub('[+\-\#\` ]', '', relation)
+            entities = m.group(2)
+            entities = re.sub('[+\-\#\` ]', '', entities)
+            ret.add(relation + '(' + entities + ').')
+    return list(ret)
+
+def convertLiteralsToArity2(literals, model: dict = None):
+    newLiterals = set()
+
+    literalsAreModes = False
+
+    if any([mode in literals[0] for mode in ["+", "-", "#", "`"]]):
+        literalsAreModes = True
+
+    if not literalsAreModes:
+        assert model is not None, "Model is required to convert literals. You can extract it from a Database object by calling the method `extractSchemaPreds`."
+
+    unaryLiterals = []
+    nAryLiterals = []
+
+    for literal in literals:
+        predicate, terms = re.findall(r"(.*)\((.*)\)\.", literal)[0]
+        terms = terms.split(",")
+        arity = len(terms)
+        if arity == 2:
+            newLiterals.add(literal)
+        elif arity == 1:
+            unaryLiterals.append(literal)
+        else:
+            nAryLiterals.append(literal)
+
+    unaryLiterals = cleanPreds(unaryLiterals)
+    nAryLiterals = cleanPreds(nAryLiterals)
+
+    for literal in unaryLiterals:
+        predicate, term = re.findall(r"(.*)\((.*)\)\.", literal)[0]
+        if literalsAreModes:
+            for firstArgMode, secondArgMode in [("+", "+"), ("+", "-"), ("-", "+")]:
+                newLiteral = f"{term}haslabel({firstArgMode}{term},{secondArgMode}{term}label)."
+                newLiterals.add(newLiteral)
+        else:
+            termType = model[predicate][0]
+            newLiteral = f"{termType}haslabel({term},{predicate})."
+            newLiterals.add(newLiteral)
+
+    nAryPredicateUniqueId = {}
+
+    for literal in nAryLiterals:
+        predicate, terms = re.findall(r"(.*)\((.*)\)\.", literal)[0]
+        terms = terms.split(",")
+        arity = len(terms)
+        if literalsAreModes:
+            for term in terms:
+                for firstArgMode, secondArgMode in [("+", "+"), ("+", "-"), ("-", "+")]:
+                    newLiteral = f"{predicate}{term}({firstArgMode}{predicate},{secondArgMode}{term})."
+                    newLiterals.add(newLiteral)
+        else:
+            termTypes = model[predicate]
+            if predicate not in nAryPredicateUniqueId:
+                nAryPredicateUniqueId[predicate] = 1
+            predicateUniqueId = nAryPredicateUniqueId[predicate]
+            for term, termType in zip(terms, termTypes):
+                newLiteral = f"{predicate}{termType}({predicate}{predicateUniqueId},{term})."
+                newLiterals.add(newLiteral)
+            nAryPredicateUniqueId[predicate] += 1
+            
+    return list(newLiterals)

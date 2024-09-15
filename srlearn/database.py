@@ -30,13 +30,16 @@ Create an instance of the database from an existing set of files.
 >>> db = Database()
 """
 
+# TODO: Review how random is being used in this script and implement a global seed.
+
 from shutil import copyfile
+import networkx as nx
 import numpy as np
 import pathlib
 import copy
 import re
 
-from typing import Type, Dict, List, Tuple
+from typing import Type, Dict, List, Tuple, Generator, Union
 from .weight import WeightStrategyBase, UniformWeight
 from .utils import utils
 
@@ -168,6 +171,34 @@ class Database:
 
         return _db
 
+    def getStatistics(self):
+        schema = self.extractSchemaPreds()
+
+        preds = schema.keys()
+
+        termTypes = []
+        for pred in schema:
+            termTypes += schema[pred]
+        termTypes = set(termTypes)
+
+        allConstants = self.getClosedWorldConstants()
+        uniqueConstants = []
+        for termType in allConstants:
+            uniqueConstants += allConstants[termType]
+        uniqueConstants = set(uniqueConstants)
+
+        statistics = {
+            "totalPredicates": len(schema),
+            "totalTermTypes": len(termTypes),
+            "totalConstants": len(uniqueConstants),
+            "targetRelation": self.getTargetRelation(),
+            "totalPositiveExamples": self.getTotalPositiveExamples(),
+            "totalGroundLiterals": self.getTotalFacts(),
+            "schema": schema
+        }
+
+        return statistics
+
     def applyMapping(self, relationMapping: Dict, termTypeMapping: Dict, termPrefix: str = None) -> Type["Database"]:
         # Mapping facts
         facts = []
@@ -225,7 +256,7 @@ class Database:
         mappedDatabase.modes = modes
 
         return mappedDatabase
-    
+
     def getTargetRelation(self):
         if len(self.pos) > 0:
             relation = re.findall(r"(.*)\(.*\)\.", self.pos[0])[0]
@@ -237,7 +268,7 @@ class Database:
         schema = {}
         for mode in self.modes:
             relation, termsTypes = re.findall(r"(.*)\((.*)\)\.", mode)[0]
-            termsTypes = [re.sub(r"[\+\-\#\s]", "", termType.strip()) for termType in termsTypes.split(",")]
+            termsTypes = [re.sub(r"[\+\-\#\`\@\s]", "", termType.strip()) for termType in termsTypes.split(",")]
             schema[relation] = termsTypes
         return schema
 
@@ -388,6 +419,13 @@ class Database:
     def getTotalFacts(self):
         return len(self.facts)
 
+    def hasRecursion(self) -> bool:
+        targetRelation = self.getTargetRelation()
+        recursionRelation = f"recursion_{targetRelation}"
+        schema = self.extractSchemaPreds()
+        hasRecursion = recursionRelation in schema
+        return hasRecursion
+
     def removeRecursion(self) -> Type["Database"]:
         targetRelation = self.getTargetRelation()
         if not targetRelation:
@@ -411,7 +449,7 @@ class Database:
         database.facts += utils.renameRelationsInPredicates(database.pos, mapping = mapping)
         return database
 
-    def setTargetPredicate(self, relationName, useRecursion = False, negPosRatio = 1, seed = None, maxFailedNegSamplingRetries = 50) -> Type["Database"]:
+    def setTargetPredicate(self, relationName, useRecursion = False, negPosRatio = 1, maxFailedNegSamplingRetries = 50) -> Type["Database"]:
         """Move positive examples of target predicate to facts and move facts of 'relationName' to positive examples list. Then, it samples negative examples."""
         assert type(negPosRatio) is int
         database = self.resetTargetPredicate()
@@ -419,7 +457,7 @@ class Database:
         database.facts = utils.removeAllPredicatesOfRelation(relationName, database.facts)
         if useRecursion:
             database = database.generateRecursion()
-        database.neg = database.generateNegativePredicates(negPosRatio, seed, maxFailedNegSamplingRetries)
+        database.neg = database.generateNegativePredicates(negPosRatio, maxFailedNegSamplingRetries, keepCurrentNegativeExamples = True)
         return database
 
     def getClosedWorldConstants(self):
@@ -444,38 +482,45 @@ class Database:
 
         return objectInstances
     
-    def generateNegativePredicates(self, negPosRatio = 1, seed = None, maxFailedSamplingRetries = 50):
-        '''Receives positive examples and generates all negative examples'''
+    def generateNegativePredicates(self, negPosRatio = 1, maxFailedSamplingRetries = 50, keepCurrentNegativeExamples: bool = True):
         targetPredicateRelation = self.getTargetRelation()
-        targetPredicateTermsTypes = self.extractSchemaPreds()[targetPredicateRelation]
-        positiveExamplesTerms = set([tuple(utils.getPredicateTerms(predicate)) for predicate in self.pos])
-        objectsInstances = {k:v for k, v in self.getClosedWorldConstants().items() if k in targetPredicateTermsTypes}
-        
-        totalNegativesToSample = negPosRatio * self.getTotalPositiveExamples()
 
-        np.random.seed(seed)
+        if keepCurrentNegativeExamples:
+            negativeExamples = set([tuple(utils.getPredicateTerms(predicate)) for predicate in self.neg])
+        else:
+            negativeExamples = set([])
+        totalNegativeExamples = len(negativeExamples)
 
-        negativeExamples = set([])
-        totalNegativeExamples = 0
-        successiveFailedSampling = 0
-        shouldExitLoop = False
-        while totalNegativeExamples < totalNegativesToSample:
-            sample = None
-            while sample in positiveExamplesTerms or sample in negativeExamples or (sample is None):
-                if successiveFailedSampling >= maxFailedSamplingRetries:
-                    shouldExitLoop = True
-                    break
-                sample = tuple([np.random.choice(objectsInstances[objType], 1)[0] for objType in targetPredicateTermsTypes])
-                successiveFailedSampling += 1
-            if shouldExitLoop:
-                break
-            negativeExamples.add(sample)
-            totalNegativeExamples += 1
+        totalPositiveExamples = self.getTotalPositiveExamples()
+        totalNegativeExpected = int(np.ceil(negPosRatio * totalPositiveExamples))
+
+        # Undersampling
+        if totalNegativeExpected < totalNegativeExamples:
+            negativeExamples = set(list(negativeExamples)[:totalNegativeExpected])
+
+        # Oversampling
+        else:
+            targetPredicateTermsTypes = self.extractSchemaPreds()[targetPredicateRelation]
+            positiveExamplesTerms = set([tuple(utils.getPredicateTerms(predicate)) for predicate in self.pos])
+            objectsInstances = {k:v for k, v in self.getClosedWorldConstants().items() if k in targetPredicateTermsTypes}
+
             successiveFailedSampling = 0
+            shouldExitLoop = False
+            while totalNegativeExamples < totalNegativeExpected:
+                sample = None
+                while sample in positiveExamplesTerms or sample in negativeExamples or (sample is None):
+                    if successiveFailedSampling >= maxFailedSamplingRetries:
+                        shouldExitLoop = True
+                        break
+                    sample = tuple([np.random.choice(objectsInstances[objType], 1)[0] for objType in targetPredicateTermsTypes])
+                    successiveFailedSampling += 1
+                if shouldExitLoop:
+                    break
+                negativeExamples.add(sample)
+                totalNegativeExamples += 1
+                successiveFailedSampling = 0
 
         negativeExamples = [f"{targetPredicateRelation}({','.join(negativeExample)})." for negativeExample in negativeExamples]
-
-        np.random.seed(None)
 
         return negativeExamples
 
@@ -507,11 +552,126 @@ class Database:
         if self.isCompatibleWithDatabase(targetDatabase):
             mergedDatabase = Database()
             mergedDatabase.modes = targetDatabase.modes
-            mergedDatabase.facts = targetDatabase.facts + sourceDatabase.facts
-            mergedDatabase.pos = targetDatabase.pos + sourceDatabase.pos
-            mergedDatabase.neg = targetDatabase.neg + sourceDatabase.neg
+            mergedDatabase.facts = list(set(targetDatabase.facts).union(set(sourceDatabase.facts)))
+            mergedDatabase.pos = list(set(targetDatabase.pos).union(set(sourceDatabase.pos)))
+            mergedDatabase.neg = list(set(targetDatabase.neg).union(set(sourceDatabase.neg)))
             return mergedDatabase
     
+    @staticmethod
+    def getKFolds(
+        database: Type["Database"], 
+        numFolds: int = 5, 
+        shuffle: bool = False
+    ) -> Generator[Type["Database"], None, None]:
+        database = copy.deepcopy(database)
+        hasRecursion = database.hasRecursion()
+
+        totalPos = database.getTotalPositiveExamples()
+        totalNeg = database.getTotalNegativeExamples()
+
+        allPos = [*database.pos]
+        allNeg = [*database.neg]
+
+        if shuffle:
+            np.random.shuffle(allPos)
+            np.random.shuffle(allNeg)
+
+        foldPosSize = int(np.ceil(totalPos/numFolds))
+        foldNegSize = int(np.ceil(totalNeg/numFolds))
+
+        for k in range(numFolds):
+            foldPosStart = k*foldPosSize
+            foldPosEnd = (k+1)*foldPosSize
+            foldNegStart = k*foldNegSize
+            foldNegEnd = (k+1)*foldNegSize
+            
+            foldPos = allPos[foldPosStart:foldPosEnd]
+            foldNeg = allNeg[foldNegStart:foldNegEnd]
+
+            databaseFold = copy.deepcopy(database)
+            databaseFold.pos = foldPos
+            databaseFold.neg = foldNeg
+
+            if hasRecursion:
+                databaseFold = databaseFold.generateRecursion()
+
+            yield databaseFold
+
+    @staticmethod
+    def convertDatabaseToArity2(database: Type["Database"]):
+        database = copy.deepcopy(database)
+        model = database.extractSchemaPreds()
+        database.facts = utils.convertLiteralsToArity2(database.facts, model = model)
+        database.pos = utils.convertLiteralsToArity2(database.pos, model = model)
+        database.neg = utils.convertLiteralsToArity2(database.neg, model = model)
+        database.modes = utils.convertLiteralsToArity2(database.modes, model = None)
+        return database
+
+    @staticmethod
+    def convertDatabaseToUndirectedGraph(database: Type["Database"]):
+        model = database.extractSchemaPreds()
+        for predicate, terms in model.items():
+            assert len(terms) == 2, "The current implementation is not able to convert predicates with arity different than 2. Try convert its predicates to arity 2 by calling the `convertDatabaseToArity2` method."
+        
+        G = nx.Graph()
+        
+        for literal in (database.facts + database.pos):
+            predicate, terms = re.findall(r"(.*)\((.*)\)\.", literal)[0]
+            terms = terms.split(",")
+            if predicate not in model:
+                continue
+            termTypes = model[predicate]
+            terms = [f"{terms[0]}{termTypes[0]}", f"{terms[1]}{termTypes[1]}"]
+            G.add_edge(*terms, edgeType = predicate)
+            nx.set_node_attributes(G, {
+                terms[0]: {"nodeType": termTypes[0]}, 
+                terms[1]: {"nodeType": termTypes[1]}, 
+            })
+
+        return G
+
+    @staticmethod
+    def populateFromGraph(graph: Union[nx.Graph, nx.DiGraph], modes: list, targetRelation: str, useRecursion = False, negPosRatio: int = 1):
+        """It returns a Database instance where:
+            - All literals have arity 2
+            - Modes are given by `modes`
+            - Target relation is given by `targetRelation`
+            - Facts and positive examples are given by `graph`
+            - Negative examples are resampled based on `negPosRatio`
+        """
+        database = Database()
+        database.modes = modes
+
+        for nodeA, nodeB, edgeAttr in graph.edges(data = True):
+            relation = edgeAttr["edgeType"]
+            schema = database.extractSchemaPreds()
+            if relation in schema:
+                nodeAType = graph.nodes[nodeA]["nodeType"]
+                nodeBType = graph.nodes[nodeB]["nodeType"]
+
+                schemaNodeAType, schemaNodeBType = schema[relation]
+
+                if nodeAType == schemaNodeAType and nodeBType == schemaNodeBType:
+                    pass
+
+                elif nodeAType == schemaNodeBType and nodeBType == schemaNodeAType:
+                    nodeA, nodeB = nodeB, nodeA
+
+                else:
+                    raise Exception(f"Unexpected node types for relation {relation}. Expceted: {schemaNodeAType, schemaNodeBType} | Got: {nodeAType, nodeBType} | Nodes: {nodeA, nodeB}")
+
+                literal = f"{relation}({nodeB},{nodeA})."
+                database.facts.append(literal)
+
+        database = database.setTargetPredicate(
+            targetRelation, 
+            useRecursion = useRecursion, 
+            negPosRatio = negPosRatio, 
+            maxFailedNegSamplingRetries = 50
+        )
+    
+        return database
+
     @staticmethod
     def prepareTransferLearningDatabase(
             sourceDatabase: Type["Database"], targetDatabase: Type["Database"], weightStrategy: WeightStrategyBase

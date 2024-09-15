@@ -87,6 +87,8 @@ class BoostSRLFiles:
         self.DIRECTORY = directory
         self.BOOSTSRL_BACKEND = here.joinpath("BoostSRL.jar")
         self.BOOSTSRL_TRANFER_LEARNER_BACKEND = here.joinpath("BoostSRLTransferLearner.jar")
+        # self.TREEBOOSTLER_BACKEND = here.joinpath("TreeBoostler.jar")
+        # self.TRANSBOOSTLER_BACKEND = here.joinpath("models/TransBoostler/TransBoostler.jar")
         self.AUC_JAR = here
         self.TRAIN_LOG = directory.joinpath("train_output.txt")
         self.TEST_LOG = directory.joinpath("test_output.txt")

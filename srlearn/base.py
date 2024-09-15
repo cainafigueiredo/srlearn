@@ -4,17 +4,19 @@
 Base class for Boosted Relational Models
 """
 
+import os
 from collections import Counter
 import inspect
 import json
+import shutil
 import logging
 import warnings
 
+from glob import glob
 from graphviz import Source
 from sklearn.utils.validation import check_is_fitted
 import subprocess
 
-from .background import Background
 from .system_manager import FileSystem
 from .utils._parse_trees import parse_tree
 from ._meta import __version__
@@ -51,48 +53,30 @@ class BaseBoostedRelationalModel:
     def __init__(
         self,
         *,
-        background=None,
-        target="None",
         n_estimators=10,
         node_size=2,
         max_tree_depth=3,
         neg_pos_ratio=2,
+        number_of_clauses=8,
+        number_of_cycles=100,
         solver = None,
         path = None
     ):
         """Initialize a BaseEstimator"""
-        self.background = background
-        self.target = target
         self.n_estimators = n_estimators
         self.neg_pos_ratio = neg_pos_ratio
+        self.node_size = node_size
+        self.max_tree_depth = max_tree_depth
+        self.number_of_clauses = number_of_clauses
+        self.number_of_cycles = number_of_cycles
         self.path = path
 
         if solver is None:
             self.solver = "BoostSRL"
         else:
-            if solver not in ("BoostSRL", "BoostSRLTransferLearner"):
-                raise ValueError("`solver` must be 'BoostSRL', or 'BoostSRLTransferLearner'")
+            if solver not in ("BoostSRL", "BoostSRLTransferLearner", "TreeBoostler", "TransBoostler"):
+                raise ValueError("`solver` must be 'BoostSRL', 'BoostSRLTransferLearner', 'TreeBoostler', or 'TransBoostler'")
             self.solver = solver
-
-        if isinstance(background, Background):
-            self.node_size = node_size
-            self.max_tree_depth = max_tree_depth
-
-    @property
-    def node_size(self):
-        return self.background.node_size
-
-    @node_size.setter
-    def node_size(self, value):
-        self.background.node_size = value
-
-    @property
-    def max_tree_depth(self):
-        return self.background.max_tree_depth
-
-    @max_tree_depth.setter
-    def max_tree_depth(self, value):
-        self.background.max_tree_depth = value
 
     @classmethod
     def _get_param_names(cls):
@@ -112,6 +96,61 @@ class BaseBoostedRelationalModel:
 
         return sorted([p.name for p in parameters])
 
+    def _saveModelFilesBackup(self, backupName = "modelBackup"):
+        oldBasePath = str(self.file_system.files.DIRECTORY)
+        newBasePath = f"{oldBasePath}/{backupName}"
+        try:
+            shutil.rmtree(newBasePath)
+        except:
+            pass
+        os.mkdir(newBasePath)
+        shutil.move(f'{oldBasePath}/train', newBasePath)
+        shutil.move(f'{oldBasePath}/test', newBasePath)
+        try:
+            shutil.move(f'{oldBasePath}/train_output.txt', newBasePath)
+        except:
+            pass
+        try:
+            shutil.move(f'{oldBasePath}/test_output.txt', newBasePath)
+        except:
+            pass
+
+        os.makedirs(f'{oldBasePath}/train', exist_ok = True)
+        os.makedirs(f'{oldBasePath}/test', exist_ok = True)
+
+    def _cleanModelFiles(self):
+        oldBasePath = str(self.file_system.files.DIRECTORY)
+        shutil.rmtree(f'{oldBasePath}/train')
+        shutil.rmtree(f'{oldBasePath}/test')
+        try:
+            os.remove(f'{oldBasePath}/train_output.txt')
+        except:
+            pass
+        try:
+            os.remove(f'{oldBasePath}/test_output.txt')
+        except:
+            pass
+
+        os.makedirs(f'{oldBasePath}/train', exist_ok = True)
+        os.makedirs(f'{oldBasePath}/test', exist_ok = True)
+
+    def _restoreModelFromBackup(self, backupName = "modelBackup"):
+        newBasePath = str(self.file_system.files.DIRECTORY)
+        backupDirPath = f"{newBasePath}/{backupName}"
+        try:
+            shutil.rmtree(f"{newBasePath}/train")
+            shutil.rmtree(f"{newBasePath}/test")
+            os.remove(f"{newBasePath}/train_output.txt")
+            os.remove(f"{newBasePath}/test_output.txt")
+        except:
+            pass
+        shutil.move(f'{backupDirPath}/train', newBasePath)
+        shutil.move(f'{backupDirPath}/test', newBasePath)
+        shutil.move(f'{backupDirPath}/train_output.txt', newBasePath)
+        shutil.move(f'{backupDirPath}/test_output.txt', newBasePath)
+
+        shutil.rmtree(backupDirPath)
+
     def _check_params(self):
         """Check validity of parameters. Raise ValueError if errors are detected.
 
@@ -120,18 +159,6 @@ class BaseBoostedRelationalModel:
         """
 
         checks = (
-            (
-                self.target,
-                (str,),
-                (lambda x: x != "None",),
-                "'target' must be a string and cannot be 'None'",
-            ),
-            (
-                self.background,
-                (Background,),
-                (),
-                "'background' must be a Background instance",
-            ),
             (
                 self.n_estimators,
                 (int,),
@@ -147,6 +174,24 @@ class BaseBoostedRelationalModel:
                 (lambda x: not isinstance(x, bool), lambda x: x >= 1.0),
                 "'neg_pos_ratio' must be 'int' or 'float'",
             ),
+            (
+                self.node_size,
+                (int,),
+                (
+                    lambda x: not isinstance(x, bool),
+                    lambda x: x >= 1,
+                ),
+                "'node_size' must be an 'int' >= 1",
+            ),
+            (
+                self.max_tree_depth,
+                (int,),
+                (
+                    lambda x: not isinstance(x, bool),
+                    lambda x: x >= 1,
+                ),
+                "'max_tree_depth' must be an 'int' >= 1",
+            ),
         )
 
         for param, types, constraints, message in checks:
@@ -159,180 +204,170 @@ class BaseBoostedRelationalModel:
         # If all params are valid, allocate a FileSystem:
         self.file_system = FileSystem(path = self.path)
 
-    def to_json(self, file_name) -> None:
-        """Serialize a learned model to json.
+    # def to_json(self, file_name) -> None:
+    #     """Serialize a learned model to json.
 
-        Parameters
-        ----------
-        file_name : str (or pathlike)
-            Path to a saved json file.
+    #     Parameters
+    #     ----------
+    #     file_name : str (or pathlike)
+    #         Path to a saved json file.
 
-        Notes / Warnings
-        ----------------
+    #     Notes / Warnings
+    #     ----------------
 
-        Intended for locally saving/loading.
+    #     Intended for locally saving/loading.
 
-        .. warning::
+    #     .. warning::
 
-            There could be major changes between releases, causing old model
-            files to break."""
-        check_is_fitted(self, "estimators_")
+    #         There could be major changes between releases, causing old model
+    #         files to break."""
+    #     check_is_fitted(self, "estimators_")
 
-        with open(
-            self.file_system.files.BRDNS_DIR.joinpath(
-                "{0}.model".format(self.target)
-            ),
-            "r",
-        ) as _fh:
-            _model = _fh.read().splitlines()
+    #     with open(
+    #         self.file_system.files.BRDNS_DIR.joinpath(
+    #             "{0}.model".format(self.target)
+    #         ),
+    #         "r",
+    #     ) as _fh:
+    #         _model = _fh.read().splitlines()
 
-        model_params = {
-            **self.__dict__,
-            "background": dict(self.background.__dict__.items())
-        }
+    #     model_params = {
+    #         **self.__dict__,
+    #     }
 
-        with open(file_name, "w") as _fh:
-            _fh.write(
-                json.dumps(
-                    [
-                        __version__,
-                        _model,
-                        self.estimators_,
-                        model_params,
-                        self._dotfiles,
-                    ]
-                )
-            )
+    #     with open(file_name, "w") as _fh:
+    #         _fh.write(
+    #             json.dumps(
+    #                 [
+    #                     __version__,
+    #                     _model,
+    #                     self.estimators_,
+    #                     model_params,
+    #                     self._dotfiles,
+    #                 ]
+    #             )
+    #         )
 
-    def from_json(self, file_name):
-        """Load a learned model from json.
+    # def from_json(self, file_name):
+    #     """Load a learned model from json.
 
-        Parameters
-        ----------
-        file_name : str (or pathlike)
-            Path to a saved json file.
+    #     Parameters
+    #     ----------
+    #     file_name : str (or pathlike)
+    #         Path to a saved json file.
 
-        Notes / Warnings
-        ----------------
+    #     Notes / Warnings
+    #     ----------------
 
-        Intended for locally saving/loading.
+    #     Intended for locally saving/loading.
 
-        .. warning::
+    #     .. warning::
 
-            There could be major changes between releases, causing old model
-            files to break. There are also *no checks* to ensure you are
-            loading the correct object type.
-        """
+    #         There could be major changes between releases, causing old model
+    #         files to break. There are also *no checks* to ensure you are
+    #         loading the correct object type.
+    #     """
 
-        with open(file_name, "r") as _fh:
-            params = json.loads(_fh.read())
+    #     with open(file_name, "r") as _fh:
+    #         params = json.loads(_fh.read())
 
-        if params[0] != __version__:
-            logging.warning(
-                "Version of loaded model ({0}) does not match srlearn version ({1}).".format(
-                    params[0], __version__
-                )
-            )
+    #     if params[0] != __version__:
+    #         logging.warning(
+    #             "Version of loaded model ({0}) does not match srlearn version ({1}).".format(
+    #                 params[0], __version__
+    #             )
+    #         )
 
-        _model = params[1]
-        _estimators = params[2]
-        _model_parameters = params[3]
+    #     _model = params[1]
+    #     _estimators = params[2]
+    #     _model_parameters = params[3]
 
-        try:
-            self._dotfiles = params[4]
-        except IndexError:
-            self._dotfiles = None
-            logging.warning(
-                "Did not find dotfiles during load, srlearn.plotting may not work."
-            )
+    #     try:
+    #         self._dotfiles = params[4]
+    #     except IndexError:
+    #         self._dotfiles = None
+    #         logging.warning(
+    #             "Did not find dotfiles during load, srlearn.plotting may not work."
+    #         )
 
-        _bkg = Background()
-        _bkg.__dict__ = _model_parameters["background"]
+    #     # 1. Loop over all class attributes of `BaseBoostedRelationalModel`
+    #     #    except `background`, `node_size`, and `max_tree_depth`, which are
+    #     #    handled by `Background` objects.
+    #     # 2. Update an `_attributes` dictionary mapping attributes from JSON
+    #     # 3. *If a key was not present in the JSON*: set it to the default value.
+    #     # 4. Initialize self by unpacking the dictionary into arguments.
+    #     _attributes = {
+    #         "node_size": _model_parameters["node_size"],
+    #         "max_tree_depth": _model_parameters["max_tree_depth"],
+    #     }
+    #     for key in set(BaseBoostedRelationalModel()._get_param_names()) - {"background", "node_size", "max_tree_depth"}:
+    #         _attributes[key] = _model_parameters.get(
+    #             key,
+    #             BaseBoostedRelationalModel().__dict__[key],
+    #         )
+    #     self.__init__(**_attributes)
 
-        # 1. Loop over all class attributes of `BaseBoostedRelationalModel`
-        #    except `background`, `node_size`, and `max_tree_depth`, which are
-        #    handled by `Background` objects.
-        # 2. Update an `_attributes` dictionary mapping attributes from JSON
-        # 3. *If a key was not present in the JSON*: set it to the default value.
-        # 4. Initialize self by unpacking the dictionary into arguments.
-        _attributes = {
-            "background": _bkg,
-            "node_size": _model_parameters["node_size"],
-            "max_tree_depth": _model_parameters["max_tree_depth"],
-        }
-        for key in set(BaseBoostedRelationalModel()._get_param_names()) - {"background", "node_size", "max_tree_depth"}:
-            _attributes[key] = _model_parameters.get(
-                key,
-                BaseBoostedRelationalModel().__dict__[key],
-            )
-        self.__init__(**_attributes)
+    #     self.estimators_ = _estimators
 
-        self.estimators_ = _estimators
+    #     # Currently allocates the File System.
+    #     self._check_params()
 
-        # Currently allocates the File System.
-        self._check_params()
+    #     self.file_system.files.TREES_DIR.mkdir(parents=True)
 
-        self.file_system.files.TREES_DIR.mkdir(parents=True)
+    #     with open(
+    #         self.file_system.files.BRDNS_DIR.joinpath(
+    #             "{0}.model".format(self.target)
+    #         ),
+    #         "w",
+    #     ) as _fh:
+    #         _fh.write("\n".join(_model))
 
-        with open(
-            self.file_system.files.BRDNS_DIR.joinpath(
-                "{0}.model".format(self.target)
-            ),
-            "w",
-        ) as _fh:
-            _fh.write("\n".join(_model))
+    #     for i, _tree in enumerate(_estimators):
+    #         with open(
+    #             self.file_system.files.TREES_DIR.joinpath(
+    #                 "{0}Tree{1}.tree".format(self.target, i)
+    #             ),
+    #             "w",
+    #         ) as _fh:
+    #             _fh.write(_tree)
 
-        for i, _tree in enumerate(_estimators):
-            with open(
-                self.file_system.files.TREES_DIR.joinpath(
-                    "{0}Tree{1}.tree".format(self.target, i)
-                ),
-                "w",
-            ) as _fh:
-                _fh.write(_tree)
+    #     return self
 
-        return self
+    # @property
+    # def feature_importances_(self):
+    #     """
+    #     Return the features contained in a tree.
 
-    @property
-    def feature_importances_(self):
-        """
-        Return the features contained in a tree.
+    #     Parameters
+    #     ----------
 
-        Parameters
-        ----------
+    #     tree_number: int
+    #         Index of the tree to read.
+    #     """
+    #     check_is_fitted(self, "estimators_")
 
-        tree_number: int
-            Index of the tree to read.
-        """
-        check_is_fitted(self, "estimators_")
+    #     features = []
 
-        features = []
-
-        for tree_number in range(self.n_estimators):
-            _rules_string = self.estimators_[tree_number]
-            features += parse_tree(
-                _rules_string, (not self.background.use_std_logic_variables)
-            )
-        return Counter(features)
+    #     for tree_number in range(self.n_estimators):
+    #         _rules_string = self.estimators_[tree_number]
+    #         features += parse_tree(
+    #             _rules_string, (not self.background.use_std_logic_variables)
+    #         )
+    #     return Counter(features)
 
     def _get_dotfiles(self):
+        dotFilePaths = glob(f"{self.file_system.files.DOT_DIR}/*.dot")
         dotfiles = []
-        for i in range(self.n_estimators):
-            with open(
-                self.file_system.files.DOT_DIR.joinpath(
-                    "WILLTreeFor_" + self.target + str(i) + ".dot"
-                )
-            ) as _fh:
+        for filepath in dotFilePaths:
+            with open(filepath) as _fh:
                 dotfiles.append(_fh.read())
         self._dotfiles = dotfiles
 
     def _generate_dotimages(self):
+        dotFilePaths = glob(f"{self.file_system.files.DOT_DIR}/*.dot")
         dotimages = []
-        for i in range(self.n_estimators):
-            path = self.file_system.files.DOT_DIR.joinpath(
-                "WILLTreeFor_" + self.target + str(i) + ".dot"
-            )
-            dotimages.append(Source.from_file(path))
+        for filepath in dotFilePaths:
+            dotimages.append(Source.from_file(filepath))
         self._dotimages = dotimages
 
     def _check_initialized(self):

@@ -22,6 +22,8 @@ class Background:
         ok_if_unknown=None,
         bridgers=None,
         ranges=None,
+        node_size=2,
+        max_tree_depth=3,
         number_of_clauses=100,
         number_of_cycles=100,
         line_search=False,
@@ -124,8 +126,8 @@ class Background:
         self.ranges = ranges
 
         # These parameters are stored in Background, but they're set in classifiers/regressors.
-        self.node_size = 2
-        self.max_tree_depth = 3
+        self.node_size = node_size
+        self.max_tree_depth = max_tree_depth
 
         # Check params are correct at the tail of initialization.
         self._check_params()
@@ -170,7 +172,7 @@ class Background:
         location : :class:`pathlib.Path`
             This should be handled by a manager to ensure locations do not overlap.
         """
-
+        
         with open(location.joinpath("{0}_bk.txt".format(filename)), "w") as _fh:
             _fh.write(str(self))
 
