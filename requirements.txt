@@ -3,6 +3,10 @@ scipy
 numpy
 graphviz
 
+# TransBoostler
+ekphrasis
+pyemd
+
 # Optional for core functionality
 relational-datasets
 

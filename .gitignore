@@ -4,6 +4,7 @@
 srlearn/train/
 srlearn/test/
 srlearn/bsrl_data/
+*/ignore_*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
